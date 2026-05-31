@@ -6,3 +6,8 @@ smoke_logs/
 *.log
 _state.txt
 _finalize_report.txt
+r3m_action_predictor/data/
+r3m_action_predictor/cache/
+r3m_action_predictor/outputs/
+r3m_action_predictor/eval_runs/
+r3m_action_predictor/_hf_meta/
