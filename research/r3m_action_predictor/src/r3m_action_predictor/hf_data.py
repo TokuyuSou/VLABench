@@ -67,15 +67,19 @@ def download_episode_parquets(episodes: list[dict], data_dir: Path) -> list[Epis
     data_dir.mkdir(parents=True, exist_ok=True)
     out: list[EpisodeInfo] = []
     for i, ep in enumerate(episodes, 1):
-        path = Path(
-            hf_hub_download(
-                REPO_ID,
-                repo_type="dataset",
-                filename=parquet_name(ep["episode_index"]),
-                local_dir=data_dir,
-            )
-        )
         feature_path = data_dir / "features" / f"episode_{ep['episode_index']:06d}_r3m.npz"
+        expected_path = data_dir / parquet_name(ep["episode_index"])
+        if feature_path.exists():
+            path = expected_path
+        else:
+            path = Path(
+                hf_hub_download(
+                    REPO_ID,
+                    repo_type="dataset",
+                    filename=parquet_name(ep["episode_index"]),
+                    local_dir=data_dir,
+                )
+            )
         out.append(
             EpisodeInfo(
                 episode_index=ep["episode_index"],
@@ -88,6 +92,24 @@ def download_episode_parquets(episodes: list[dict], data_dir: Path) -> list[Epis
         if i % 10 == 0 or i == len(episodes):
             print(f"Downloaded/verified {i}/{len(episodes)} episode parquet files", flush=True)
     return out
+
+
+def cleanup_episode_parquets(episodes: list[EpisodeInfo]) -> tuple[int, int]:
+    removed = 0
+    bytes_removed = 0
+    for ep in episodes:
+        parquet_path = Path(ep.parquet_path)
+        feature_path = Path(ep.feature_path)
+        if not feature_path.exists() or not parquet_path.exists():
+            continue
+        try:
+            size = parquet_path.stat().st_size
+            parquet_path.unlink()
+        except FileNotFoundError:
+            continue
+        removed += 1
+        bytes_removed += size
+    return removed, bytes_removed
 
 
 def split_episodes(

@@ -5,9 +5,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .action_repr import RAW_ACTION_DIM, REPR_ACTION_DIM, euler_to_repr, repr_std_to_euler_std
 from .config import ExperimentConfig
 from .data import Normalizer
-from .model import build_model
+from .model import build_model, split_model_output
 from .r3m_features import ensure_r3m_repo, load_r3m_from_repo, pil_bytes_to_chw_uint8
 from .risk import action_output_to_raw_and_norm, load_risk_head, make_risk_features
 
@@ -27,6 +28,8 @@ class LoadedPredictor:
             k: Normalizer(np.asarray(v["mean"], dtype=np.float32), np.asarray(v["std"], dtype=np.float32))
             for k, v in ckpt["normalizers"].items()
         }
+        self.model_action_dim = int(np.asarray(self.normalizers["action"].mean).shape[-1])
+        self.config["action_dim"] = self.model_action_dim
 
         # R3M feature shape is fixed after feature extraction: [num_views, embed_dim].
         num_views = int(np.asarray(self.normalizers["embedding"].mean).shape[0])
@@ -50,7 +53,9 @@ class LoadedPredictor:
 
         emb_norm = self.normalizers["embedding"].encode(embeddings)
         state_norm = self.normalizers["state"].encode(state)
-        prev_norm = self.normalizers["action"].encode(prev_actions)
+        # prev_actions arrive as raw 7-D Euler. Some existing checkpoints use raw
+        # Euler model-space actions; newer ones use the 10-D sin/cos representation.
+        prev_norm = self.normalizers["action"].encode(self._actions_to_model_space(prev_actions))
 
         batch = {
             "embeddings": torch.from_numpy(emb_norm[None]).to(self.device),
@@ -59,6 +64,7 @@ class LoadedPredictor:
             "raw_prev_actions": torch.from_numpy(prev_actions[None]).to(self.device),
         }
         model_out = self.model(batch["embeddings"], batch["state"], batch["prev_actions"])
+        _, _, prefix_logits = split_model_output(model_out)
         action_mean = torch.from_numpy(self.normalizers["action"].mean).to(self.device)
         action_std = torch.from_numpy(self.normalizers["action"].std).to(self.device)
         pred, pred_norm_abs, std_norm = action_output_to_raw_and_norm(
@@ -71,13 +77,28 @@ class LoadedPredictor:
 
         out = {"actions": pred[0].detach().cpu().numpy()}
         if std_norm is not None:
-            raw_std = std_norm * action_std
+            raw_model_std = std_norm * action_std
+            if self.model_action_dim == RAW_ACTION_DIM:
+                raw_std = raw_model_std
+            elif self.model_action_dim == REPR_ACTION_DIM:
+                # Map the per-dim sin/cos std back to a 7-D Euler-space std.
+                raw_std = repr_std_to_euler_std(raw_model_std)
+            else:
+                raise ValueError(f"Unsupported action dim: {self.model_action_dim}")
             confidence_per_step = 1.0 / (1.0 + std_norm.mean(dim=-1))
             out.update(
                 {
                     "action_std": raw_std[0].detach().cpu().numpy(),
                     "confidence_per_step": confidence_per_step[0].detach().cpu().numpy(),
                     "confidence": float(confidence_per_step.mean().detach().cpu()),
+                }
+            )
+        if prefix_logits is not None:
+            prefix_p = torch.sigmoid(prefix_logits[0])
+            out.update(
+                {
+                    "prefix_safe_probability": prefix_p.detach().cpu().numpy(),
+                    "risk_safe_probability": float(prefix_p.mean().detach().cpu()),
                 }
             )
         if self.risk_head is not None:
@@ -89,8 +110,17 @@ class LoadedPredictor:
                 std_norm,
             )
             risk_logit = self.risk_head(risk_features)
-            risk_p_safe = torch.sigmoid(risk_logit)
+            objective = self.risk_checkpoint.get("objective", "classification") if self.risk_checkpoint else "classification"
             threshold = self.risk_checkpoint.get("selected_threshold") if self.risk_checkpoint else None
+            if objective == "regression":
+                # Head predicts a nonnegative cost (lower = safer). Map to a safe
+                # probability so the existing risk-gated policy can threshold it
+                # (selected_threshold is already stored in this 1/(1+cost) space).
+                cost = torch.nn.functional.softplus(risk_logit)
+                risk_p_safe = 1.0 / (1.0 + cost)
+                out["risk_predicted_cost"] = float(cost.item())
+            else:
+                risk_p_safe = torch.sigmoid(risk_logit)
             out.update(
                 {
                     "risk_safe_probability": float(risk_p_safe.item()),
@@ -99,6 +129,13 @@ class LoadedPredictor:
                 }
             )
         return out
+
+    def _actions_to_model_space(self, actions: np.ndarray) -> np.ndarray:
+        if self.model_action_dim == RAW_ACTION_DIM:
+            return actions.astype(np.float32, copy=False)
+        if self.model_action_dim == REPR_ACTION_DIM:
+            return euler_to_repr(actions)
+        raise ValueError(f"Unsupported action dim: {self.model_action_dim}")
 
 
 def load_predictor(
@@ -140,6 +177,14 @@ class OnlineR3MActionPredictor:
         return emb.detach().float().cpu().numpy()
 
     @torch.no_grad()
+    def encode_view_history(self, frames: list[tuple[np.ndarray, np.ndarray, np.ndarray]]) -> np.ndarray:
+        encoded = [
+            self.encode_views(image=image, second_image=second_image, wrist_image=wrist_image)
+            for image, second_image, wrist_image in frames
+        ]
+        return np.stack(encoded, axis=0)
+
+    @torch.no_grad()
     def predict_from_observation(
         self,
         image: np.ndarray,
@@ -147,6 +192,17 @@ class OnlineR3MActionPredictor:
         wrist_image: np.ndarray,
         state: np.ndarray,
         prev_actions: np.ndarray,
+        image_history: list[tuple[np.ndarray, np.ndarray, np.ndarray]] | None = None,
     ) -> dict:
-        embeddings = self.encode_views(image=image, second_image=second_image, wrist_image=wrist_image)
+        obs_horizon = int(self.predictor.config.get("obs_horizon", 1))
+        if obs_horizon > 1:
+            frames = list(image_history or [])
+            if not frames:
+                frames = [(image, second_image, wrist_image)]
+            frames = frames[-obs_horizon:]
+            while len(frames) < obs_horizon:
+                frames.insert(0, frames[0])
+            embeddings = self.encode_view_history(frames)
+        else:
+            embeddings = self.encode_views(image=image, second_image=second_image, wrist_image=wrist_image)
         return self.predictor.predict(embeddings, state, prev_actions)

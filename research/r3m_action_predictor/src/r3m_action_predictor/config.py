@@ -28,6 +28,7 @@ class ExperimentConfig:
     stratified_split: bool = True
     prev_horizon: int = 8
     pred_horizon: int = 8
+    obs_horizon: int = 1
     r3m_model: str = "resnet18"
     embedding_batch_size: int = 96
     force_features: bool = False
@@ -43,6 +44,13 @@ class ExperimentConfig:
     dropout: float = 0.05
     nll_weight: float = 1.0
     mse_weight: float = 0.25
+    smoothness_weight: float = 0.0
+    prefix_risk_weight: float = 0.0
+    prefix_risk_warmup_epochs: int = 0
+    prefix_pos_threshold: float = 0.03
+    prefix_rot_threshold: float = 0.20
+    prefix_gripper_threshold: float = 0.5
+    critical_action_weight: float = 0.0
     lr: float = 3e-4
     weight_decay: float = 1e-4
     grad_clip: float = 1.0

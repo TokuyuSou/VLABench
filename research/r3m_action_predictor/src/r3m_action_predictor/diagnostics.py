@@ -9,11 +9,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from .action_repr import repr_std_to_euler_std
 from .config import ExperimentConfig
 from .data import ChunkDataset, FeatureStore, Normalizer
 from .hf_data import EpisodeInfo
 from .metrics import batch_to_device, evaluate
 from .model import build_model
+from .risk import action_output_to_raw_and_norm, wrap_angle
 
 
 def main() -> None:
@@ -42,8 +44,8 @@ def main() -> None:
 
     report = {"run_dir": str(run_dir), "config": config, "splits": {}}
     for split, loader in loaders.items():
-        split_report = evaluate(model, loader, normalizers["action"], device, config.get("target_mode", "absolute"))
-        split_report.update(_detailed_metrics(model, loader, normalizers["action"], device, config.get("target_mode", "absolute")))
+        split_report = evaluate(model, loader, normalizers, device, config.get("target_mode", "absolute"))
+        split_report.update(_detailed_metrics(model, loader, normalizers, device, config.get("target_mode", "absolute")))
         report["splits"][split] = split_report
 
     out_path = run_dir / args.output_name
@@ -70,13 +72,14 @@ def _with_defaults(config: dict) -> dict:
 def _detailed_metrics(
     model: torch.nn.Module,
     loader: DataLoader,
-    action_norm: Normalizer,
+    normalizers: dict[str, Normalizer],
     device: torch.device,
     target_mode: str,
 ) -> dict:
     model.eval()
-    action_mean = torch.from_numpy(action_norm.mean).to(device=device, dtype=torch.float32)
-    action_std = torch.from_numpy(action_norm.std).to(device=device, dtype=torch.float32)
+    action_mean = torch.from_numpy(normalizers["action"].mean).to(device=device, dtype=torch.float32)
+    action_std = torch.from_numpy(normalizers["action"].std).to(device=device, dtype=torch.float32)
+    euler_std = normalizers["action_euler"].std
     horizon_sq = []
     task_sq: dict[str, list[float]] = defaultdict(list)
     task_count: dict[str, int] = defaultdict(int)
@@ -85,18 +88,14 @@ def _detailed_metrics(
 
     for batch in loader:
         batch = batch_to_device(batch, device)
-        repeat = batch["raw_prev_actions"][:, -1:, :].repeat(1, batch["raw_target"].shape[1], 1)
         model_out = model(batch["embeddings"], batch["state"], batch["prev_actions"])
-        if isinstance(model_out, tuple):
-            pred_norm, log_std = model_out
-            pred_std = torch.exp(log_std) * action_std
-        else:
-            pred_norm, pred_std = model_out, None
-        if target_mode == "residual":
-            pred = repeat + pred_norm * action_std
-        else:
-            pred = pred_norm * action_std + action_mean
-        err = (pred - batch["raw_target"]).detach().cpu().numpy()
+        pred, _, pred_std_norm = action_output_to_raw_and_norm(
+            model_out, batch, action_mean, action_std, target_mode
+        )
+        pred_std = repr_std_to_euler_std(pred_std_norm * action_std) if pred_std_norm is not None else None
+        err = pred - batch["raw_target"]
+        err = torch.cat([err[..., :3], wrap_angle(err[..., 3:6]), err[..., 6:]], dim=-1)
+        err = err.detach().cpu().numpy()
         sq = np.square(err).mean(axis=2)
         horizon_sq.append(sq)
 
@@ -109,7 +108,7 @@ def _detailed_metrics(
 
         if pred_std is not None:
             std_scalar = pred_std.detach().cpu().numpy().reshape(err.shape[0], -1).mean(axis=1)
-            err_scalar = (np.abs(err) / action_norm.std.reshape(1, 1, -1)).reshape(err.shape[0], -1).mean(axis=1)
+            err_scalar = (np.abs(err) / euler_std.reshape(1, 1, -1)).reshape(err.shape[0], -1).mean(axis=1)
             for s, e in zip(std_scalar.tolist(), err_scalar.tolist()):
                 confidence_rows.append({"predicted_std": s, "confidence": 1.0 / (1.0 + s), "norm_abs_error": e})
 

@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from .action_repr import RAW_ACTION_DIM, REPR_ACTION_DIM, SINCOS_REPR_SLICE, euler_to_repr
 from .config import ACTION_DIM, STATE_DIM
 from .hf_data import EpisodeInfo
 
@@ -63,12 +64,32 @@ def fit_normalizers(store: FeatureStore) -> dict[str, Normalizer]:
     emb_dim = store.episodes[0]["embeddings"].shape[-1]
     emb_m = OnlineMoments((1, emb_dim))
     state_m = OnlineMoments((STATE_DIM,))
-    action_m = OnlineMoments((ACTION_DIM,))
+    # "action" is the continuous sin/cos model space; "action_euler" keeps the raw
+    # 7-D Euler statistics for metric scaling and the constant-mean baseline.
+    action_m = OnlineMoments((REPR_ACTION_DIM,))
+    action_euler_m = OnlineMoments((ACTION_DIM,))
     for embeddings, states, actions in store.iter_arrays():
         emb_m.update(embeddings.reshape(-1, emb_dim))
         state_m.update(states)
-        action_m.update(actions)
-    return {"embedding": emb_m.finish(), "state": state_m.finish(), "action": action_m.finish()}
+        action_m.update(euler_to_repr(actions))
+        action_euler_m.update(actions)
+    action_norm = action_m.finish()
+    # Leave the sin/cos angle columns unstandardized (mean 0, std 1). Standardizing
+    # them divides each column by its own std, and a near-constant angle axis (e.g. a
+    # fixed roll/pitch whose cos has std ~ 1e-4) gets divided by a tiny number. That
+    # explodes both the action loss and the risk chunk-cost on physically negligible
+    # dimensions. Identity scaling preserves the unit-circle geometry so a sin/cos
+    # error stays proportional to the true angular error. Position (0:3) and gripper
+    # (9) keep their fitted statistics. Both atan2 decoding and the residual path are
+    # unaffected because they read these same mean/std values back.
+    action_norm.mean[SINCOS_REPR_SLICE] = 0.0
+    action_norm.std[SINCOS_REPR_SLICE] = 1.0
+    return {
+        "embedding": emb_m.finish(),
+        "state": state_m.finish(),
+        "action": action_norm,
+        "action_euler": action_euler_m.finish(),
+    }
 
 
 class ChunkDataset(Dataset):
@@ -78,15 +99,18 @@ class ChunkDataset(Dataset):
         normalizers: dict[str, Normalizer],
         prev_horizon: int,
         pred_horizon: int,
+        obs_horizon: int = 1,
     ):
         self.store = store
         self.normalizers = normalizers
         self.prev_horizon = prev_horizon
         self.pred_horizon = pred_horizon
+        self.obs_horizon = obs_horizon
         self.index: list[tuple[int, int]] = []
         for ep_i, ep in enumerate(store.episodes):
             length = ep["actions"].shape[0]
-            for t in range(prev_horizon, length - pred_horizon + 1):
+            start = max(prev_horizon, obs_horizon - 1)
+            for t in range(start, length - pred_horizon + 1):
                 self.index.append((ep_i, t))
 
     def __len__(self) -> int:
@@ -95,10 +119,17 @@ class ChunkDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         ep_i, t = self.index[idx]
         ep = self.store.episodes[ep_i]
-        embeddings = self.normalizers["embedding"].encode(ep["embeddings"][t])
+        if self.obs_horizon > 1:
+            embeddings = self.normalizers["embedding"].encode(
+                ep["embeddings"][t - self.obs_horizon + 1 : t + 1]
+            )
+        else:
+            embeddings = self.normalizers["embedding"].encode(ep["embeddings"][t])
         state = self.normalizers["state"].encode(ep["states"][t])
-        prev_actions = self.normalizers["action"].encode(ep["actions"][t - self.prev_horizon : t])
-        target = self.normalizers["action"].encode(ep["actions"][t : t + self.pred_horizon])
+        prev_euler = ep["actions"][t - self.prev_horizon : t]
+        target_euler = ep["actions"][t : t + self.pred_horizon]
+        prev_actions = self.normalizers["action"].encode(_actions_to_model_space(prev_euler, self.normalizers))
+        target = self.normalizers["action"].encode(_actions_to_model_space(target_euler, self.normalizers))
 
         return {
             "embeddings": torch.from_numpy(embeddings.astype(np.float32)),
@@ -115,6 +146,15 @@ class ChunkDataset(Dataset):
         }
 
 
+def _actions_to_model_space(actions: np.ndarray, normalizers: dict[str, Normalizer]) -> np.ndarray:
+    action_dim = int(np.asarray(normalizers["action"].mean).shape[-1])
+    if action_dim == RAW_ACTION_DIM:
+        return actions.astype(np.float32, copy=False)
+    if action_dim == REPR_ACTION_DIM:
+        return euler_to_repr(actions)
+    raise ValueError(f"Unsupported action normalizer dim: {action_dim}")
+
+
 def make_loaders(
     train: list[EpisodeInfo],
     val: list[EpisodeInfo],
@@ -122,13 +162,14 @@ def make_loaders(
     prev_horizon: int,
     pred_horizon: int,
     batch_size: int,
+    obs_horizon: int = 1,
 ) -> tuple[DataLoader, DataLoader, DataLoader, dict[str, Normalizer], dict[str, int]]:
     train_store = FeatureStore(train)
     normalizers = fit_normalizers(train_store)
     datasets = {
-        "train": ChunkDataset(train_store, normalizers, prev_horizon, pred_horizon),
-        "val": ChunkDataset(FeatureStore(val), normalizers, prev_horizon, pred_horizon),
-        "test": ChunkDataset(FeatureStore(test), normalizers, prev_horizon, pred_horizon),
+        "train": ChunkDataset(train_store, normalizers, prev_horizon, pred_horizon, obs_horizon),
+        "val": ChunkDataset(FeatureStore(val), normalizers, prev_horizon, pred_horizon, obs_horizon),
+        "test": ChunkDataset(FeatureStore(test), normalizers, prev_horizon, pred_horizon, obs_horizon),
     }
     loaders = {
         split: DataLoader(

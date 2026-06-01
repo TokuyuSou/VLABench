@@ -33,9 +33,10 @@ class Args:
     visulization: bool = True
     confidence_threshold: float = 0.979
     min_step_confidence: float = 0.94
-    max_substitution_fraction: float = 0.22
+    max_substitution_fraction: float | None = None
     min_vla_calls_before_substitute: int = 3
     vla_cooldown_after_substitute: int = 1
+    max_consecutive_substitutions: int = 0
     checkpoint_path: str = (
         "research/r3m_action_predictor/outputs/"
         "add_condiment_r3m18_residual_transformer_200/best_model.pt"
@@ -60,9 +61,10 @@ class HybridPi0Policy(Policy):
         min_step_confidence: float,
         decision_metric: str,
         risk_threshold: float | None,
-        max_substitution_fraction: float,
+        max_substitution_fraction: float | None,
         min_vla_calls_before_substitute: int,
         vla_cooldown_after_substitute: int,
+        max_consecutive_substitutions: int,
         log_full_chunks: bool,
     ):
         self.model = client
@@ -75,11 +77,21 @@ class HybridPi0Policy(Policy):
         self.max_substitution_fraction = max_substitution_fraction
         self.min_vla_calls_before_substitute = min_vla_calls_before_substitute
         self.vla_cooldown_after_substitute = vla_cooldown_after_substitute
+        self.max_consecutive_substitutions = max_consecutive_substitutions
         self.log_full_chunks = log_full_chunks
 
         self.action_plan = collections.deque()
         self.action_meta = collections.deque()
-        self.prev_actions = collections.deque(maxlen=8)
+        predictor_config = getattr(self.predictor.predictor, "config", {})
+        self.prev_horizon = int(predictor_config.get("prev_horizon", replan_steps))
+        self.pred_horizon = int(predictor_config.get("pred_horizon", replan_steps))
+        if self.replan_steps > self.pred_horizon:
+            raise ValueError(
+                f"replan_steps={self.replan_steps} exceeds predictor pred_horizon={self.pred_horizon}"
+            )
+        self.prev_actions = collections.deque(maxlen=max(self.prev_horizon, 1))
+        obs_horizon = int(predictor_config.get("obs_horizon", 1))
+        self.image_history = collections.deque(maxlen=max(obs_horizon, 1))
 
         log_dir.mkdir(parents=True, exist_ok=True)
         self.step_log_path = log_dir / "step_events.jsonl"
@@ -96,6 +108,7 @@ class HybridPi0Policy(Policy):
         self.substitutions = 0
         self.rejected_candidates = 0
         self.cooldown_remaining = 0
+        self.consecutive_substitutions = 0
         self.episode_stats: list[dict[str, Any]] = []
         self._current_episode_stats: dict[str, Any] | None = None
 
@@ -105,9 +118,11 @@ class HybridPi0Policy(Policy):
         self.episode_step = 0
         self.replan_index = 0
         self.cooldown_remaining = 0
+        self.consecutive_substitutions = 0
         self.action_plan.clear()
         self.action_meta.clear()
         self.prev_actions.clear()
+        self.image_history.clear()
         self._current_episode_stats = {
             "episode_index": self.episode_index,
             "vla_calls": 0,
@@ -119,6 +134,7 @@ class HybridPi0Policy(Policy):
         }
 
     def predict(self, obs, **kwargs):
+        self._remember_observation(obs)
         if len(self.action_plan) == 0:
             self._plan_next_chunk(obs)
 
@@ -146,16 +162,20 @@ class HybridPi0Policy(Policy):
             "episode_step": self.episode_step,
             "global_step": self.global_step,
             "replan_index": self.replan_index,
-            "history_ready": len(self.prev_actions) >= 8,
+            "history_ready": len(self.prev_actions) >= self.prev_horizon,
+            "prev_horizon": self.prev_horizon,
+            "pred_horizon": self.pred_horizon,
             "threshold": self.confidence_threshold,
             "min_step_confidence": self.min_step_confidence,
             "decision_metric": self.decision_metric,
             "risk_threshold": self.risk_threshold,
             "max_substitution_fraction": self.max_substitution_fraction,
             "cooldown_remaining": self.cooldown_remaining,
+            "consecutive_substitutions": self.consecutive_substitutions,
+            "max_consecutive_substitutions": self.max_consecutive_substitutions,
         }
 
-        if len(self.prev_actions) >= 8:
+        if len(self.prev_actions) >= self.prev_horizon:
             second_image, _, image, image_wrist = obs["rgb"]
             candidate = self.predictor.predict_from_observation(
                 image=image,
@@ -163,19 +183,24 @@ class HybridPi0Policy(Policy):
                 wrist_image=image_wrist,
                 state=state,
                 prev_actions=np.asarray(self.prev_actions, dtype=np.float32),
+                image_history=list(self.image_history),
             )
             conf = float(candidate.get("confidence", 0.0))
             conf_per_step = np.asarray(candidate.get("confidence_per_step", []), dtype=np.float32)
             min_exec_conf = float(np.min(conf_per_step[: self.replan_steps])) if len(conf_per_step) else 0.0
             risk_p_safe = candidate.get("risk_safe_probability")
+            prefix_probs = np.asarray(candidate.get("prefix_safe_probability", []), dtype=np.float32)
             risk_threshold = self.risk_threshold
             if risk_threshold is None:
                 risk_threshold = candidate.get("risk_threshold")
+            accepted_prefix_len = self._accepted_prefix_len(prefix_probs, risk_threshold)
             decision.update(
                 {
                     "candidate_confidence": conf,
                     "candidate_min_exec_step_confidence": min_exec_conf,
                     "candidate_risk_safe_probability": risk_p_safe,
+                    "candidate_prefix_safe_probability": prefix_probs.tolist() if len(prefix_probs) else None,
+                    "candidate_accepted_prefix_len": accepted_prefix_len,
                     "candidate_risk_threshold": risk_threshold,
                     "candidate_action_std_mean": float(np.mean(candidate["action_std"])),
                     "candidate_action_std_max": float(np.max(candidate["action_std"])),
@@ -196,8 +221,10 @@ class HybridPi0Policy(Policy):
         decision["decision_threshold"] = threshold
 
         if use_substitute:
-            actions = np.asarray(candidate["actions"], dtype=np.float32)[: self.replan_steps]
+            exec_len = int(decision.get("candidate_accepted_prefix_len") or self.replan_steps)
+            actions = np.asarray(candidate["actions"], dtype=np.float32)[:exec_len]
             self.substitutions += 1
+            self.consecutive_substitutions += 1
             self.cooldown_remaining = self.vla_cooldown_after_substitute
             if self._current_episode_stats is not None:
                 self._current_episode_stats["substitutions"] += 1
@@ -215,6 +242,7 @@ class HybridPi0Policy(Policy):
             confidence = None
             vla_called = True
             self.vla_calls += 1
+            self.consecutive_substitutions = 0
             if self._current_episode_stats is not None:
                 self._current_episode_stats["vla_calls"] += 1
             if self.cooldown_remaining > 0:
@@ -240,6 +268,10 @@ class HybridPi0Policy(Policy):
                     "chunk_confidence": confidence,
                     "chunk_decision_metric": self.decision_metric,
                     "chunk_risk_safe_probability": candidate.get("risk_safe_probability") if candidate else None,
+                    "chunk_prefix_safe_probability": candidate.get("prefix_safe_probability").tolist()
+                    if candidate and candidate.get("prefix_safe_probability") is not None
+                    else None,
+                    "chunk_executed_len": len(actions),
                     "vla_called_for_chunk": vla_called,
                 }
             )
@@ -251,14 +283,19 @@ class HybridPi0Policy(Policy):
             reasons.append("no_candidate_or_history")
             return False, reasons
         if self.decision_metric == "risk":
-            risk_p_safe = decision.get("candidate_risk_safe_probability")
-            risk_threshold = self.risk_threshold
-            if risk_threshold is None:
-                risk_threshold = decision.get("candidate_risk_threshold")
-            if risk_p_safe is None or risk_threshold is None:
-                reasons.append("risk_score_unavailable")
-            elif float(risk_p_safe) < float(risk_threshold):
-                reasons.append("risk_below_threshold")
+            prefix_len = decision.get("candidate_accepted_prefix_len")
+            if prefix_len is not None:
+                if prefix_len < 1:
+                    reasons.append("prefix_risk_below_threshold")
+            else:
+                risk_p_safe = decision.get("candidate_risk_safe_probability")
+                risk_threshold = self.risk_threshold
+                if risk_threshold is None:
+                    risk_threshold = decision.get("candidate_risk_threshold")
+                if risk_p_safe is None or risk_threshold is None:
+                    reasons.append("risk_score_unavailable")
+                elif float(risk_p_safe) < float(risk_threshold):
+                    reasons.append("risk_below_threshold")
         else:
             conf = decision.get("candidate_confidence", 0.0)
             min_step_conf = decision.get("candidate_min_exec_step_confidence", 0.0)
@@ -270,10 +307,18 @@ class HybridPi0Policy(Policy):
             reasons.append("min_vla_calls_not_met")
         if self.cooldown_remaining > 0:
             reasons.append("cooldown")
-        next_fraction = (self.substitutions + 1) / max(self.vla_calls + self.substitutions + 1, 1)
-        if next_fraction > self.max_substitution_fraction:
-            reasons.append("replacement_budget")
-        if not _actions_are_safe(np.asarray(candidate["actions"][: self.replan_steps]), np.asarray(self.prev_actions[-1])):
+        if (
+            self.max_consecutive_substitutions > 0
+            and self.consecutive_substitutions >= self.max_consecutive_substitutions
+        ):
+            reasons.append("consecutive_substitution_limit")
+        if self.max_substitution_fraction is not None:
+            next_fraction = (self.substitutions + 1) / max(self.vla_calls + self.substitutions + 1, 1)
+            if next_fraction > self.max_substitution_fraction:
+                reasons.append("replacement_budget")
+        safety_len = int(decision.get("candidate_accepted_prefix_len") or self.replan_steps)
+        safety_len = min(max(safety_len, 1), self.replan_steps)
+        if not _actions_are_safe(np.asarray(candidate["actions"][:safety_len]), np.asarray(self.prev_actions[-1])):
             reasons.append("action_safety_gate")
         return len(reasons) == 0, reasons
 
@@ -314,6 +359,8 @@ class HybridPi0Policy(Policy):
             "chunk_confidence": meta["chunk_confidence"],
             "chunk_decision_metric": meta["chunk_decision_metric"],
             "chunk_risk_safe_probability": meta["chunk_risk_safe_probability"],
+            "chunk_prefix_safe_probability": meta["chunk_prefix_safe_probability"],
+            "chunk_executed_len": meta["chunk_executed_len"],
             "vla_called_for_chunk": meta["vla_called_for_chunk"],
             "action_robot_frame": action.tolist(),
             "target_pos_world": np.asarray(abs_target_pos).tolist(),
@@ -347,6 +394,9 @@ class HybridPi0Policy(Policy):
             "min_step_confidence": self.min_step_confidence,
             "risk_threshold": self.risk_threshold,
             "max_substitution_fraction": self.max_substitution_fraction,
+            "min_vla_calls_before_substitute": self.min_vla_calls_before_substitute,
+            "vla_cooldown_after_substitute": self.vla_cooldown_after_substitute,
+            "max_consecutive_substitutions": self.max_consecutive_substitutions,
             "total_vla_calls": self.vla_calls,
             "total_substitutions": self.substitutions,
             "total_replans": self.vla_calls + self.substitutions,
@@ -375,6 +425,24 @@ class HybridPi0Policy(Policy):
         if self.decision_metric == "risk":
             return "pi05_r3m_risk_substitute"
         return "pi05_r3m_conf_substitute"
+
+    def _remember_observation(self, obs) -> None:
+        second_image, _, image, image_wrist = obs["rgb"]
+        self.image_history.append((image, second_image, image_wrist))
+
+    def _accepted_prefix_len(self, prefix_probs: np.ndarray, threshold: float | None) -> int | None:
+        if len(prefix_probs) == 0:
+            return None
+        if threshold is None:
+            threshold = 0.5
+        limit = min(len(prefix_probs), self.replan_steps)
+        accepted = 0
+        for i, prob in enumerate(prefix_probs[:limit], start=1):
+            if float(prob) >= float(threshold):
+                accepted = i
+            else:
+                break
+        return accepted
 
 
 def _policy_state_from_obs(obs) -> np.ndarray:
@@ -450,6 +518,7 @@ def main(args: Args) -> None:
         max_substitution_fraction=args.max_substitution_fraction,
         min_vla_calls_before_substitute=args.min_vla_calls_before_substitute,
         vla_cooldown_after_substitute=args.vla_cooldown_after_substitute,
+        max_consecutive_substitutions=args.max_consecutive_substitutions,
         log_full_chunks=args.log_full_chunks,
     )
 
