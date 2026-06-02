@@ -131,7 +131,7 @@ class ChunkDataset(Dataset):
         prev_actions = self.normalizers["action"].encode(_actions_to_model_space(prev_euler, self.normalizers))
         target = self.normalizers["action"].encode(_actions_to_model_space(target_euler, self.normalizers))
 
-        return {
+        item = {
             "embeddings": torch.from_numpy(embeddings.astype(np.float32)),
             "state": torch.from_numpy(state.astype(np.float32)),
             "prev_actions": torch.from_numpy(prev_actions.astype(np.float32)),
@@ -144,6 +144,13 @@ class ChunkDataset(Dataset):
             "frame_index": torch.tensor(t, dtype=torch.int64),
             "task": ep["task"],
         }
+        # Retrieval hints are attached per-frame by retrieval.attach_retrieval (opt-in); when
+        # absent the batch is byte-for-byte the original and every existing model path is unchanged.
+        if "retr_actions" in ep:
+            item["retr_actions"] = torch.from_numpy(ep["retr_actions"][t])
+            item["retr_sim"] = torch.from_numpy(ep["retr_sim"][t])
+            item["retr_mask"] = torch.from_numpy(ep["retr_mask"][t])
+        return item
 
 
 def _actions_to_model_space(actions: np.ndarray, normalizers: dict[str, Normalizer]) -> np.ndarray:
@@ -163,13 +170,19 @@ def make_loaders(
     pred_horizon: int,
     batch_size: int,
     obs_horizon: int = 1,
+    attach_fn=None,
 ) -> tuple[DataLoader, DataLoader, DataLoader, dict[str, Normalizer], dict[str, int]]:
     train_store = FeatureStore(train)
     normalizers = fit_normalizers(train_store)
+    stores = {"train": train_store, "val": FeatureStore(val), "test": FeatureStore(test)}
+    # attach_fn (e.g. retrieval.attach_retrieval bound to a cache) decorates each store's
+    # episodes in place; passed as a callback so data.py stays free of retrieval imports.
+    if attach_fn is not None:
+        for store in stores.values():
+            attach_fn(store, normalizers)
     datasets = {
-        "train": ChunkDataset(train_store, normalizers, prev_horizon, pred_horizon, obs_horizon),
-        "val": ChunkDataset(FeatureStore(val), normalizers, prev_horizon, pred_horizon, obs_horizon),
-        "test": ChunkDataset(FeatureStore(test), normalizers, prev_horizon, pred_horizon, obs_horizon),
+        split: ChunkDataset(store, normalizers, prev_horizon, pred_horizon, obs_horizon)
+        for split, store in stores.items()
     }
     loaders = {
         split: DataLoader(

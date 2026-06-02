@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from .action_repr import euler_to_repr, repr_to_euler
 from .data import Normalizer
 from .metrics import batch_to_device, evaluate, log_scalars, make_tb_writer
-from .model import build_model, parameter_count, split_model_output
+from .model import build_model, parameter_count, run_model, split_model_output
 from .risk import RiskLabelConfig, safe_prefix_labels
 
 
@@ -88,7 +88,7 @@ def _train_one_epoch(
         batch = batch_to_device(batch, device)
         opt.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
-            model_out = model(batch["embeddings"], batch["state"], batch["prev_actions"])
+            model_out = run_model(model, batch)
             target = _training_target(batch, config)
             loss = _loss_for_output(model_out, target, batch, action_mean, action_std, config, epoch)
         scaler.scale(loss).backward()

@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from .config import ExperimentConfig
-from .data import make_loaders
+from .data import FeatureStore, make_loaders
 from .hf_data import (
     cleanup_episode_parquets,
     download_episode_parquets,
@@ -20,6 +20,7 @@ from .hf_data import (
     write_manifest,
 )
 from .r3m_features import extract_all_features
+from .retrieval import attach_retrieval, build_cache
 from .train import train_model
 
 
@@ -43,7 +44,7 @@ def parse_args() -> ExperimentConfig:
     p.add_argument(
         "--model-kind",
         default=defaults.model_kind,
-        choices=("mlp_gru", "prob_transformer", "shared_prefix_risk_transformer"),
+        choices=("mlp_gru", "prob_transformer", "shared_prefix_risk_transformer", "retrieval_aug"),
     )
     p.add_argument("--target-mode", default=defaults.target_mode, choices=("absolute", "residual"))
     p.add_argument("--view-dim", type=int, default=defaults.view_dim)
@@ -55,6 +56,10 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--nll-weight", type=float, default=defaults.nll_weight)
     p.add_argument("--mse-weight", type=float, default=defaults.mse_weight)
     p.add_argument("--smoothness-weight", type=float, default=defaults.smoothness_weight)
+    p.add_argument("--retrieval-k", type=int, default=defaults.retrieval_k)
+    p.add_argument("--retrieval-build-episodes", type=int, default=defaults.retrieval_build_episodes)
+    p.add_argument("--retrieval-w-obs", type=float, default=defaults.retrieval_w_obs)
+    p.add_argument("--retrieval-w-state", type=float, default=defaults.retrieval_w_state)
     p.add_argument("--prefix-risk-weight", type=float, default=defaults.prefix_risk_weight)
     p.add_argument("--prefix-risk-warmup-epochs", type=int, default=defaults.prefix_risk_warmup_epochs)
     p.add_argument("--prefix-pos-threshold", type=float, default=defaults.prefix_pos_threshold)
@@ -71,6 +76,46 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--output-dir", type=Path, default=defaults.output_dir)
     args = p.parse_args()
     return replace(defaults, **vars(args))
+
+
+def _retrieval_attach_fn(cfg: ExperimentConfig, config: dict, action_episodes: list):
+    """Build a retrieval cache from a demo set DISJOINT from the predictor's episodes and
+    return an attach callback for make_loaders. The cache is built once (with the predictor's
+    own train-fit normalizers, so queries share the key space) and saved for inference."""
+    _, _, episodes_jsonl = download_metadata(cfg.meta_dir)
+    candidates = select_episodes(episodes_jsonl, cfg.task_regex, 0, cfg.seed)
+    a_idx = {int(e.episode_index) for e in action_episodes}  # action_episodes are EpisodeInfo objects
+    candidates = [e for e in candidates if int(e["episode_index"]) not in a_idx]
+    random.Random(cfg.seed).shuffle(candidates)
+    candidates = candidates[: cfg.retrieval_build_episodes]
+    if len(candidates) < cfg.retrieval_build_episodes:
+        raise RuntimeError(
+            f"Only {len(candidates)} retrieval episodes available outside the predictor set; "
+            f"requested {cfg.retrieval_build_episodes}"
+        )
+    candidates.sort(key=lambda e: int(e["episode_index"]))
+    b_eps = []
+    for start in range(0, len(candidates), 50):
+        batch = candidates[start : start + 50]
+        be = download_episode_parquets(batch, cfg.data_dir)
+        b_eps.extend(be)
+        extract_all_features(
+            be, r3m_model=cfg.r3m_model, batch_size=cfg.embedding_batch_size, force=False, cache_dir=cfg.cache_dir
+        )
+        cleanup_episode_parquets(be)
+    b_store = FeatureStore(b_eps)
+    print(f"Retrieval source: {len(b_store.episodes)} episodes disjoint from predictor data", flush=True)
+
+    holder: dict = {}
+
+    def attach_fn(store, normalizers):
+        if "cache" not in holder:
+            holder["cache"] = build_cache(b_store, normalizers, cfg.pred_horizon)
+            holder["cache"].save(cfg.output_dir / "retrieval_cache.npz")
+            print(f"Built retrieval cache: {holder['cache'].obs_keys.shape[0]} entries", flush=True)
+        attach_retrieval(store, holder["cache"], normalizers, cfg.retrieval_k, cfg.retrieval_w_obs, cfg.retrieval_w_state)
+
+    return attach_fn
 
 
 def main() -> None:
@@ -106,6 +151,7 @@ def main() -> None:
     )
     print(f"Episode split: train={len(train_eps)} val={len(val_eps)} test={len(test_eps)}", flush=True)
 
+    attach_fn = _retrieval_attach_fn(cfg, config, episodes) if cfg.model_kind == "retrieval_aug" else None
     train_loader, val_loader, test_loader, normalizers, sample_counts = make_loaders(
         train_eps,
         val_eps,
@@ -114,6 +160,7 @@ def main() -> None:
         cfg.pred_horizon,
         cfg.batch_size,
         cfg.obs_horizon,
+        attach_fn=attach_fn,
     )
     print(f"Frame-chunk samples: {sample_counts}", flush=True)
 

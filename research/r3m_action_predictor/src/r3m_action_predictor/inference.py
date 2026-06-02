@@ -8,7 +8,7 @@ import torch
 from .action_repr import RAW_ACTION_DIM, REPR_ACTION_DIM, euler_to_repr, repr_std_to_euler_std
 from .config import ExperimentConfig
 from .data import Normalizer
-from .model import build_model, split_model_output
+from .model import build_model, run_model, split_model_output
 from .r3m_features import ensure_r3m_repo, load_r3m_from_repo, pil_bytes_to_chw_uint8
 from .risk import action_output_to_raw_and_norm, load_risk_head, make_risk_features
 
@@ -19,6 +19,7 @@ class LoadedPredictor:
         checkpoint_path: Path,
         device: str | None = None,
         risk_head_path: str | Path | None = None,
+        retrieval_cache_path: str | Path | None = None,
     ):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -45,8 +46,20 @@ class LoadedPredictor:
         if risk_head_path:
             self.risk_head, self.risk_checkpoint = load_risk_head(risk_head_path, device=self.device)
 
+        # Retrieval cache: only relevant for a retrieval_aug model. Use the explicit path, else
+        # auto-discover one saved next to the checkpoint. Absent cache -> model runs hint-free.
+        self.retrieval_cache = None
+        if getattr(self.model, "uses_retrieval", False):
+            from .retrieval import RetrievalCache
+
+            cache_path = Path(retrieval_cache_path) if retrieval_cache_path else (
+                Path(checkpoint_path).parent / "retrieval_cache.npz"
+            )
+            if cache_path.exists():
+                self.retrieval_cache = RetrievalCache.load(cache_path)
+
     @torch.no_grad()
-    def predict(self, embeddings: np.ndarray, state: np.ndarray, prev_actions: np.ndarray) -> dict:
+    def predict(self, embeddings: np.ndarray, state: np.ndarray, prev_actions: np.ndarray, task: str | None = None) -> dict:
         embeddings = np.asarray(embeddings, dtype=np.float32)
         state = np.asarray(state, dtype=np.float32)
         prev_actions = np.asarray(prev_actions, dtype=np.float32)
@@ -63,7 +76,8 @@ class LoadedPredictor:
             "prev_actions": torch.from_numpy(prev_norm[None]).to(self.device),
             "raw_prev_actions": torch.from_numpy(prev_actions[None]).to(self.device),
         }
-        model_out = self.model(batch["embeddings"], batch["state"], batch["prev_actions"])
+        self._add_retrieval(batch, embeddings, state, task)
+        model_out = run_model(self.model, batch)
         _, _, prefix_logits = split_model_output(model_out)
         action_mean = torch.from_numpy(self.normalizers["action"].mean).to(self.device)
         action_std = torch.from_numpy(self.normalizers["action"].std).to(self.device)
@@ -130,6 +144,23 @@ class LoadedPredictor:
             )
         return out
 
+    def _add_retrieval(self, batch: dict, embeddings: np.ndarray, state: np.ndarray, task: str | None) -> None:
+        """Attach instruction-filtered retrieval hints to the batch (no-op without a cache/task)."""
+        if self.retrieval_cache is None or task is None:
+            return
+        from .retrieval import make_keys, retrieve
+
+        obs_key, state_key = make_keys(self.normalizers, embeddings, state)
+        a, s, m = retrieve(
+            self.retrieval_cache, task, obs_key, state_key,
+            int(self.config.get("retrieval_k", 4)),
+            float(self.config.get("retrieval_w_obs", 1.0)),
+            float(self.config.get("retrieval_w_state", 1.0)),
+        )
+        batch["retr_actions"] = torch.from_numpy(a[None]).to(self.device)
+        batch["retr_sim"] = torch.from_numpy(s[None]).to(self.device)
+        batch["retr_mask"] = torch.from_numpy(m[None]).to(self.device)
+
     def _actions_to_model_space(self, actions: np.ndarray) -> np.ndarray:
         if self.model_action_dim == RAW_ACTION_DIM:
             return actions.astype(np.float32, copy=False)
@@ -193,6 +224,7 @@ class OnlineR3MActionPredictor:
         state: np.ndarray,
         prev_actions: np.ndarray,
         image_history: list[tuple[np.ndarray, np.ndarray, np.ndarray]] | None = None,
+        task: str | None = None,
     ) -> dict:
         obs_horizon = int(self.predictor.config.get("obs_horizon", 1))
         if obs_horizon > 1:
@@ -205,4 +237,4 @@ class OnlineR3MActionPredictor:
             embeddings = self.encode_view_history(frames)
         else:
             embeddings = self.encode_views(image=image, second_image=second_image, wrist_image=wrist_image)
-        return self.predictor.predict(embeddings, state, prev_actions)
+        return self.predictor.predict(embeddings, state, prev_actions, task=task)

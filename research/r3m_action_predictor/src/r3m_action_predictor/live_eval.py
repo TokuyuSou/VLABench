@@ -184,6 +184,7 @@ class HybridPi0Policy(Policy):
                 state=state,
                 prev_actions=np.asarray(self.prev_actions, dtype=np.float32),
                 image_history=list(self.image_history),
+                task=obs.get("instruction"),
             )
             conf = float(candidate.get("confidence", 0.0))
             conf_per_step = np.asarray(candidate.get("confidence_per_step", []), dtype=np.float32)

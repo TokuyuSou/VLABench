@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from .action_repr import repr_std_to_euler_std
 from .data import Normalizer
 from .risk import RiskLabelConfig, action_output_to_raw_and_norm, safe_prefix_labels
-from .model import split_model_output
+from .model import run_model, split_model_output
 
 
 def make_tb_writer(out_dir):
@@ -71,7 +71,7 @@ def evaluate(
         batch = batch_to_device(batch, device)
         target = batch["raw_target"]
         repeat = batch["raw_prev_actions"][:, -1:, :].repeat(1, target.shape[1], 1)
-        model_out = model(batch["embeddings"], batch["state"], batch["prev_actions"])
+        model_out = run_model(model, batch)
         _, _, prefix_logits = split_model_output(model_out)
         # Decode model output from sin/cos repr back to 7-D Euler.
         pred, _, pred_std_norm = action_output_to_raw_and_norm(

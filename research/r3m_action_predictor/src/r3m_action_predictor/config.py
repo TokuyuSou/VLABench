@@ -45,6 +45,10 @@ class ExperimentConfig:
     nll_weight: float = 1.0
     mse_weight: float = 0.25
     smoothness_weight: float = 0.0
+    retrieval_k: int = 4
+    retrieval_build_episodes: int = 0
+    retrieval_w_obs: float = 1.0
+    retrieval_w_state: float = 1.0
     prefix_risk_weight: float = 0.0
     prefix_risk_warmup_epochs: int = 0
     prefix_pos_threshold: float = 0.03

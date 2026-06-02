@@ -14,7 +14,8 @@ from .config import ExperimentConfig
 from .data import ChunkDataset, FeatureStore, Normalizer
 from .hf_data import EpisodeInfo, cleanup_episode_parquets, download_episode_parquets, download_metadata, select_episodes
 from .metrics import log_scalars, make_tb_writer
-from .model import build_model
+from .model import build_model, run_model
+from .retrieval import attach_retrieval, build_cache
 from .r3m_features import extract_all_features
 from .risk import (
     RiskHead,
@@ -54,6 +55,19 @@ def main() -> None:
     train_eps = label_eps[:n_train]
     calib_eps = label_eps[n_train:] or label_eps[-1:]
 
+    # If the action predictor is retrieval-augmented, the risk head MUST see the same
+    # hint-conditioned predictions it will meet at deployment. Rebuild the predictor's cache
+    # (identical disjoint set B + the predictor's own normalizers) so the keys/values match,
+    # and rely on leave-one-out in attach_retrieval to avoid self-retrieval (the risk label
+    # episodes coincide with B under the default selection).
+    retrieval_cache = None
+    if action_config.get("model_kind") == "retrieval_aug":
+        b_eps = build_external_risk_episodes(
+            action_config, manifest, args, n=int(action_config["retrieval_build_episodes"])
+        )
+        retrieval_cache = build_cache(FeatureStore(b_eps), normalizers, action_config["pred_horizon"])
+        print(f"Retrieval risk head: cache {retrieval_cache.obs_keys.shape[0]} entries (leave-one-out)", flush=True)
+
     train_loader, calib_loader, action_model, risk_head, input_dim = build_components(
         train_eps,
         calib_eps,
@@ -61,6 +75,7 @@ def main() -> None:
         action_config,
         normalizers,
         args,
+        retrieval_cache,
     )
     if args.dry_run:
         print(
@@ -179,7 +194,8 @@ def main() -> None:
     print(f"Wrote {args.output_dir / 'risk_head.pt'}")
 
 
-def build_external_risk_episodes(action_config, action_manifest, args) -> list[EpisodeInfo]:
+def build_external_risk_episodes(action_config, action_manifest, args, n: int | None = None) -> list[EpisodeInfo]:
+    n = args.external_risk_episodes if n is None else n
     task_regex = args.task_regex or action_config["task_regex"]
     meta_dir = args.meta_dir or Path(action_config["meta_dir"])
     data_dir = args.data_dir or Path(action_config["data_dir"])
@@ -196,11 +212,11 @@ def build_external_risk_episodes(action_config, action_manifest, args) -> list[E
     candidates = [ep for ep in candidates if int(ep["episode_index"]) not in action_episode_indices]
     rng = random.Random(args.seed)
     rng.shuffle(candidates)
-    candidates = candidates[: args.external_risk_episodes]
-    if len(candidates) < args.external_risk_episodes:
+    candidates = candidates[:n]
+    if len(candidates) < n:
         raise RuntimeError(
-            f"Only found {len(candidates)} external risk episodes for {task_regex!r}; "
-            f"requested {args.external_risk_episodes}"
+            f"Only found {len(candidates)} episodes for {task_regex!r} outside the predictor set; "
+            f"requested {n}"
         )
     candidates.sort(key=lambda ep: int(ep["episode_index"]))
     episodes: list[EpisodeInfo] = []
@@ -230,8 +246,18 @@ def build_external_risk_episodes(action_config, action_manifest, args) -> list[E
     return episodes
 
 
-def build_components(train_eps, calib_eps, action_ckpt, action_config, normalizers, args):
+def build_components(train_eps, calib_eps, action_ckpt, action_config, normalizers, args, retrieval_cache=None):
     train_store = FeatureStore(train_eps)
+    calib_store = FeatureStore(calib_eps)
+    if retrieval_cache is not None:
+        for store in (train_store, calib_store):
+            attach_retrieval(
+                store, retrieval_cache, normalizers,
+                int(action_config["retrieval_k"]),
+                float(action_config["retrieval_w_obs"]),
+                float(action_config["retrieval_w_state"]),
+                exclude_self=True,
+            )
     sample_ep = train_store.episodes[0]
     action_model = build_model(
         action_config,
@@ -240,20 +266,13 @@ def build_components(train_eps, calib_eps, action_ckpt, action_config, normalize
     )
     action_model.load_state_dict(action_ckpt["model_state"])
     dummy = ChunkDataset(train_store, normalizers, action_config["prev_horizon"], action_config["pred_horizon"])[0]
+    dummy_batch = {k: v[None] if torch.is_tensor(v) else v for k, v in dummy.items()}
     with torch.no_grad():
-        model_out = action_model(
-            dummy["embeddings"][None],
-            dummy["state"][None],
-            dummy["prev_actions"][None],
-        )
+        model_out = run_model(action_model, dummy_batch)
         action_mean = torch.from_numpy(normalizers["action"].mean)
         action_std = torch.from_numpy(normalizers["action"].std)
         _, pred_norm_abs, pred_std_norm = action_output_to_raw_and_norm(
-            model_out,
-            {k: v[None] if torch.is_tensor(v) else v for k, v in dummy.items()},
-            action_mean,
-            action_std,
-            action_config["target_mode"],
+            model_out, dummy_batch, action_mean, action_std, action_config["target_mode"],
         )
         features = make_risk_features(
             dummy["embeddings"][None],
@@ -264,7 +283,7 @@ def build_components(train_eps, calib_eps, action_ckpt, action_config, normalize
         )
     risk_head = RiskHead(features.shape[-1], hidden_dim=args.hidden_dim, dropout=args.dropout)
     train_ds = ChunkDataset(train_store, normalizers, action_config["prev_horizon"], action_config["pred_horizon"])
-    calib_ds = ChunkDataset(FeatureStore(calib_eps), normalizers, action_config["prev_horizon"], action_config["pred_horizon"])
+    calib_ds = ChunkDataset(calib_store, normalizers, action_config["prev_horizon"], action_config["pred_horizon"])
     return (
         DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True),
         DataLoader(calib_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True),
@@ -281,7 +300,7 @@ def train_one_epoch(risk_head, action_model, loader, opt, action_mean, action_st
         batch = _to_device(batch, device)
         with torch.no_grad():
             pred_raw, pred_norm_abs, pred_std_norm = action_output_to_raw_and_norm(
-                action_model(batch["embeddings"], batch["state"], batch["prev_actions"]),
+                run_model(action_model, batch),
                 batch,
                 action_mean,
                 action_std,
@@ -318,7 +337,7 @@ def evaluate_risk(
     for batch in loader:
         batch = _to_device(batch, device)
         pred_raw, pred_norm_abs, pred_std_norm = action_output_to_raw_and_norm(
-            action_model(batch["embeddings"], batch["state"], batch["prev_actions"]),
+            run_model(action_model, batch),
             batch,
             action_mean,
             action_std,
@@ -402,7 +421,7 @@ def train_one_epoch_reg(
         batch = _to_device(batch, device)
         with torch.no_grad():
             pred_raw, pred_norm_abs, pred_std_norm = action_output_to_raw_and_norm(
-                action_model(batch["embeddings"], batch["state"], batch["prev_actions"]),
+                run_model(action_model, batch),
                 batch, action_mean, action_std, target_mode,
             )
             cost = chunk_cost_labels(pred_raw, batch["raw_target"], repr_std, grip_weight, horizon)
@@ -429,7 +448,7 @@ def evaluate_reg(
     for batch in loader:
         batch = _to_device(batch, device)
         pred_raw, pred_norm_abs, pred_std_norm = action_output_to_raw_and_norm(
-            action_model(batch["embeddings"], batch["state"], batch["prev_actions"]),
+            run_model(action_model, batch),
             batch, action_mean, action_std, target_mode,
         )
         cost = chunk_cost_labels(pred_raw, batch["raw_target"], repr_std, grip_weight, horizon)
