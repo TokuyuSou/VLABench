@@ -47,6 +47,8 @@ def parse_args() -> ExperimentConfig:
         choices=("mlp_gru", "prob_transformer", "shared_prefix_risk_transformer", "retrieval_aug"),
     )
     p.add_argument("--target-mode", default=defaults.target_mode, choices=("absolute", "residual"))
+    p.add_argument("--no-vision", dest="use_vision", action="store_false",
+                   help="Proprio-only predictor: drop view tokens / embedding risk features.")
     p.add_argument("--view-dim", type=int, default=defaults.view_dim)
     p.add_argument("--width", type=int, default=defaults.width)
     p.add_argument("--hidden-dim", type=int, default=defaults.hidden_dim)

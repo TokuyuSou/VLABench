@@ -90,6 +90,13 @@ class LoadedPredictor:
         )
 
         out = {"actions": pred[0].detach().cpu().numpy()}
+        # Envelope/aleatoric gates score in the normalized sin/cos repr space the predictor
+        # natively emits its residual in: pred_delta_norm is the per-step residual from the
+        # last executed action (= pred_norm_abs - repeat_norm), pred_std_norm the predicted std.
+        repeat_norm = batch["prev_actions"][:, -1:, :].repeat(1, pred_norm_abs.shape[1], 1)
+        out["pred_delta_norm"] = (pred_norm_abs - repeat_norm)[0].detach().cpu().numpy()
+        if std_norm is not None:
+            out["pred_std_norm"] = std_norm[0].detach().cpu().numpy()
         if std_norm is not None:
             raw_model_std = std_norm * action_std
             if self.model_action_dim == RAW_ACTION_DIM:

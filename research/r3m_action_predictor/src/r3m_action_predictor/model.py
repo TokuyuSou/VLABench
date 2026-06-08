@@ -86,17 +86,26 @@ class ProbabilisticTransformerActionPredictor(nn.Module):
         transformer_layers: int,
         transformer_heads: int,
         dropout: float = 0.10,
+        use_vision: bool = True,
     ):
         super().__init__()
         self.pred_horizon = pred_horizon
         self.action_dim = action_dim
-        self.context_len = num_views + 1 + prev_horizon
+        self.use_vision = use_vision
+        self.num_views = num_views if use_vision else 0
+        self.context_len = self.num_views + 1 + prev_horizon
 
-        self.view_proj = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, view_dim),
-            nn.GELU(),
-            nn.Linear(view_dim, width),
+        # Proprio-only (use_vision=False) drops the view tokens entirely; the feature cache's
+        # embeddings are simply ignored at forward time (no view_proj is built).
+        self.view_proj = (
+            nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, view_dim),
+                nn.GELU(),
+                nn.Linear(view_dim, width),
+            )
+            if use_vision
+            else None
         )
         self.state_proj = nn.Sequential(
             nn.LayerNorm(STATE_DIM),
@@ -132,12 +141,15 @@ class ProbabilisticTransformerActionPredictor(nn.Module):
         )
 
     def forward(self, embeddings: torch.Tensor, state: torch.Tensor, prev_actions: torch.Tensor):
-        bsz, num_views, embed_dim = embeddings.shape
-        view = self.view_proj(embeddings.reshape(bsz * num_views, embed_dim)).reshape(bsz, num_views, -1)
         state_tok = self.state_proj(state).unsqueeze(1)
         action = self.action_proj(prev_actions)
-        query = self.query_tokens.unsqueeze(0).expand(bsz, -1, -1)
-        tokens = torch.cat([view, state_tok, action, query], dim=1)
+        query = self.query_tokens.unsqueeze(0).expand(state.shape[0], -1, -1)
+        parts = []
+        if self.use_vision:
+            bsz, num_views, embed_dim = embeddings.shape
+            parts.append(self.view_proj(embeddings.reshape(bsz * num_views, embed_dim)).reshape(bsz, num_views, -1))
+        parts += [state_tok, action, query]
+        tokens = torch.cat(parts, dim=1)
         tokens = tokens + self.pos.unsqueeze(0)
         hidden = self.encoder(tokens)
         out = self.head(hidden[:, -self.pred_horizon :])
@@ -359,6 +371,7 @@ def build_model(config: dict, embed_dim: int, num_views: int) -> nn.Module:
             transformer_layers=config.get("transformer_layers", 4),
             transformer_heads=config.get("transformer_heads", 4),
             dropout=config["dropout"],
+            use_vision=config.get("use_vision", True),
         )
     if kind == "retrieval_aug":
         return RetrievalActionPredictor(

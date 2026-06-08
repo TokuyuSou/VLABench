@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import glob
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,7 @@ from VLABench.tasks import *  # noqa: F403,F401 - registers task classes for loa
 from VLABench.utils.utils import quaternion_to_euler
 
 from .inference import OnlineR3MActionPredictor
+from .metrics import skip_by_outcome
 
 
 @dataclasses.dataclass
@@ -44,6 +47,12 @@ class Args:
     risk_head_path: str | None = None
     decision_metric: str = "confidence"
     risk_threshold: float | None = None
+    # Envelope / aleatoric gates (learning-free; decision_metric="envelope"|"aleatoric").
+    # For these gates a LOWER score means safer-to-substitute, so a candidate is accepted
+    # when score <= threshold (the opposite direction from risk/confidence).
+    envelope_gate_path: str | None = None
+    envelope_threshold: float | None = None
+    aleatoric_threshold: float | None = None
     r3m_cache_dir: str = "research/r3m_action_predictor/cache"
     predictor_device: str = "cpu"
     log_full_chunks: bool = True
@@ -66,6 +75,9 @@ class HybridPi0Policy(Policy):
         vla_cooldown_after_substitute: int,
         max_consecutive_substitutions: int,
         log_full_chunks: bool,
+        envelope_gate: dict | None = None,
+        envelope_threshold: float | None = None,
+        aleatoric_threshold: float | None = None,
     ):
         self.model = client
         self.predictor = predictor
@@ -74,6 +86,23 @@ class HybridPi0Policy(Policy):
         self.min_step_confidence = min_step_confidence
         self.decision_metric = decision_metric
         self.risk_threshold = risk_threshold
+        # Envelope/aleatoric gate config. cont_dims/sigma/grip come from the npz built by
+        # build_envelope_gate; aleatoric falls back to the continuous repr dims if no file.
+        self.envelope_gate = envelope_gate
+        self.envelope_threshold = envelope_threshold
+        self.aleatoric_threshold = aleatoric_threshold
+        if envelope_gate is not None:
+            self._env_sigma = np.asarray(envelope_gate["sigma"], dtype=np.float32)
+            self._env_cont_dims = np.asarray(envelope_gate["cont_dims"], dtype=np.int64)
+            self._grip_raw_idx = int(envelope_gate["grip_raw_idx"])
+            self._grip_threshold = float(envelope_gate["gripper_threshold"])
+            if envelope_threshold is None and "threshold" in envelope_gate:
+                self.envelope_threshold = float(envelope_gate["threshold"])
+        else:
+            self._env_sigma = None
+            self._env_cont_dims = np.arange(0, 9, dtype=np.int64)  # pos(3)+sincos(6)
+            self._grip_raw_idx = 6
+            self._grip_threshold = 0.5
         self.max_substitution_fraction = max_substitution_fraction
         self.min_vla_calls_before_substitute = min_vla_calls_before_substitute
         self.vla_cooldown_after_substitute = vla_cooldown_after_substitute
@@ -94,6 +123,7 @@ class HybridPi0Policy(Policy):
         self.image_history = collections.deque(maxlen=max(obs_horizon, 1))
 
         log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir = log_dir
         self.step_log_path = log_dir / "step_events.jsonl"
         self.chunk_log_path = log_dir / "chunk_decisions.jsonl"
         self.summary_path = log_dir / "policy_summary.json"
@@ -213,6 +243,9 @@ class HybridPi0Policy(Policy):
             )
             if self._current_episode_stats is not None:
                 self._current_episode_stats["candidate_confidences"].append(conf)
+            if self.decision_metric in ("envelope", "aleatoric"):
+                decision["candidate_env_score"] = self._gate_score(candidate)
+                decision["candidate_gripper_changed"] = self._gripper_changes(candidate)
 
         use_substitute, reject_reasons = self._should_substitute(decision, candidate)
         decision["use_substitute"] = use_substitute
@@ -283,7 +316,18 @@ class HybridPi0Policy(Policy):
         if candidate is None:
             reasons.append("no_candidate_or_history")
             return False, reasons
-        if self.decision_metric == "risk":
+        if self.decision_metric in ("envelope", "aleatoric"):
+            # Learning-free gates: LOWER score = safer. Accept when score <= threshold and the
+            # predicted gripper open/close state never flips within the executed prefix.
+            score = decision.get("candidate_env_score")
+            threshold = self.envelope_threshold if self.decision_metric == "envelope" else self.aleatoric_threshold
+            if score is None or threshold is None:
+                reasons.append("gate_score_unavailable")
+            elif float(score) > float(threshold):
+                reasons.append("envelope_above_threshold")
+            if decision.get("candidate_gripper_changed"):
+                reasons.append("gripper_change")
+        elif self.decision_metric == "risk":
             prefix_len = decision.get("candidate_accepted_prefix_len")
             if prefix_len is not None:
                 if prefix_len < 1:
@@ -304,7 +348,16 @@ class HybridPi0Policy(Policy):
                 reasons.append("confidence_below_threshold")
             if min_step_conf < self.min_step_confidence:
                 reasons.append("step_confidence_below_threshold")
-        if self.vla_calls < self.min_vla_calls_before_substitute:
+        # Per-episode VLA-call count (not the global cumulative one): the threshold calibration
+        # simulates vla_calls=0 at each episode start, so the online gate must match it or later
+        # episodes would substitute the moment history is ready. Falls back to the global counter
+        # only if episode stats are somehow unavailable.
+        episode_vla = (
+            self._current_episode_stats["vla_calls"]
+            if self._current_episode_stats is not None
+            else self.vla_calls
+        )
+        if episode_vla < self.min_vla_calls_before_substitute:
             reasons.append("min_vla_calls_not_met")
         if self.cooldown_remaining > 0:
             reasons.append("cooldown")
@@ -324,12 +377,42 @@ class HybridPi0Policy(Policy):
         return len(reasons) == 0, reasons
 
     def _decision_score_and_threshold(self, decision: dict) -> tuple[float | None, float | None]:
+        if self.decision_metric in ("envelope", "aleatoric"):
+            threshold = self.envelope_threshold if self.decision_metric == "envelope" else self.aleatoric_threshold
+            return decision.get("candidate_env_score"), threshold
         if self.decision_metric == "risk":
             threshold = self.risk_threshold
             if threshold is None:
                 threshold = decision.get("candidate_risk_threshold")
             return decision.get("candidate_risk_safe_probability"), threshold
         return decision.get("candidate_confidence"), self.confidence_threshold
+
+    def _gate_score(self, candidate: dict) -> float | None:
+        """Learning-free gate score over the executed prefix (lower = safer to substitute).
+
+        envelope:  max over (steps x continuous repr dims) of |residual_norm| / sigma.
+        aleatoric: mean over (steps x continuous repr dims) of the predicted normalized std.
+        Both live in the normalized sin/cos repr space; the gripper dim is vetoed separately."""
+        cont = self._env_cont_dims
+        if self.decision_metric == "envelope":
+            delta = candidate.get("pred_delta_norm")
+            if delta is None or self._env_sigma is None:
+                return None
+            delta = np.abs(np.asarray(delta, dtype=np.float32)[: self.replan_steps][:, cont])
+            return float(np.max(delta / self._env_sigma[cont]))
+        std = candidate.get("pred_std_norm")
+        if std is None:
+            return None
+        std = np.asarray(std, dtype=np.float32)[: self.replan_steps][:, cont]
+        return float(np.mean(std))
+
+    def _gripper_changes(self, candidate: dict) -> bool:
+        """True if the predicted gripper open/close state flips from the last executed action
+        anywhere in the executed prefix (raw 7-D space, threshold from the envelope file)."""
+        pred = np.asarray(candidate["actions"], dtype=np.float32)[: self.replan_steps]
+        last = np.asarray(self.prev_actions[-1], dtype=np.float32)
+        idx, thr = self._grip_raw_idx, self._grip_threshold
+        return bool(np.any((pred[:, idx] > thr) != (last[idx] > thr)))
 
     def _call_vla(self, obs, state: np.ndarray) -> np.ndarray:
         second_image, _, image, image_wrist = obs["rgb"]
@@ -386,6 +469,16 @@ class HybridPi0Policy(Policy):
         self.episode_stats.append(stats)
         self._current_episode_stats = None
 
+    def _success_by_episode(self) -> dict[int, bool]:
+        """episode_index -> success, parsed from the saved video filenames
+        (<idx>_success_<bool>_progress_<p>.mp4). Empty if visualization was off."""
+        out: dict[int, bool] = {}
+        for v in glob.glob(str(self.log_dir.parent / "*" / "videos" / "*.mp4")):
+            m = re.match(r"(\d+)_success_(True|False)", os.path.basename(v))
+            if m:
+                out[int(m.group(1))] = m.group(2) == "True"
+        return out
+
     def write_summary(self, metrics: dict[str, Any]) -> None:
         self._finalize_episode_stats()
         summary = {
@@ -404,6 +497,7 @@ class HybridPi0Policy(Policy):
             "replacement_fraction": self._replacement_fraction(),
             "rejected_candidates": self.rejected_candidates,
             "episode_stats": self.episode_stats,
+            "skip_by_outcome": skip_by_outcome(self.episode_stats, self._success_by_episode()),
             "metrics": metrics,
             "step_log": str(self.step_log_path),
             "chunk_log": str(self.chunk_log_path),
@@ -423,9 +517,7 @@ class HybridPi0Policy(Policy):
 
     @property
     def name(self):
-        if self.decision_metric == "risk":
-            return "pi05_r3m_risk_substitute"
-        return "pi05_r3m_conf_substitute"
+        return f"pi05_r3m_{self.decision_metric}_substitute"
 
     def _remember_observation(self, obs) -> None:
         second_image, _, image, image_wrist = obs["rgb"]
@@ -507,6 +599,9 @@ def main(args: Args) -> None:
         device=args.predictor_device,
         risk_head_path=args.risk_head_path,
     )
+    envelope_gate = None
+    if args.envelope_gate_path:
+        envelope_gate = dict(np.load(args.envelope_gate_path, allow_pickle=True))
     policy = HybridPi0Policy(
         client,
         predictor,
@@ -521,6 +616,9 @@ def main(args: Args) -> None:
         vla_cooldown_after_substitute=args.vla_cooldown_after_substitute,
         max_consecutive_substitutions=args.max_consecutive_substitutions,
         log_full_chunks=args.log_full_chunks,
+        envelope_gate=envelope_gate,
+        envelope_threshold=args.envelope_threshold,
+        aleatoric_threshold=args.aleatoric_threshold,
     )
 
     evaluator = Evaluator(

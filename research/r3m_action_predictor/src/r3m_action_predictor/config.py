@@ -36,6 +36,9 @@ class ExperimentConfig:
     batch_size: int = 1024
     model_kind: str = "mlp_gru"
     target_mode: str = "absolute"
+    # use_vision=False -> proprio-only predictor (no view tokens; risk features drop the
+    # embedding block). The feature cache is reused as-is (embeddings simply go unused).
+    use_vision: bool = True
     view_dim: int = 128
     width: int = 256
     hidden_dim: int = 512
