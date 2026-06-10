@@ -78,9 +78,7 @@ def build_sigma(
         raise RuntimeError("No demonstration frames found to estimate sigma.")
     stacked = np.concatenate(chunks, axis=0)
     sigma = stacked.std(axis=0).astype(np.float32)
-    # Floor so a (near-)constant dim never makes the |.|/sigma score explode.
-    sigma = np.maximum(sigma, 1e-6)
-    return sigma, len(store.episodes)
+    return sigma, len(store.episodes)   # raw per-dim std; the meaningful floor is applied by the caller
 
 
 def main() -> None:
@@ -96,6 +94,12 @@ def main() -> None:
     ap.add_argument("--threshold", type=float, default=1.0,
                     help="Default sigma multiplier stored in the file (calibrated later)")
     ap.add_argument("--gripper-threshold", type=float, default=0.5)
+    ap.add_argument("--sigma-floor", type=float, default=0.05,
+                    help="Floor on each per-dim sigma (normalized repr units). A near-constant angle "
+                         "dim (e.g. cos of a fixed wrist roll/pitch) has sigma->0, which makes "
+                         "|residual|/sigma explode and dominate the max envelope score; flooring keeps "
+                         "the score driven by dims that actually vary, while a large anomalous "
+                         "deviation on a near-constant dim still raises the score. 0 disables.")
     ap.add_argument("--all-success", action="store_true",
                     help="Treat every episode as success (VLABench demos are all successful). "
                          "Kept for parity with the rollout-feature path; demo features have no "
@@ -123,13 +127,18 @@ def main() -> None:
     store = FeatureStore(episodes)
 
     offset_horizons = [int(x) for x in args.offset_horizons.split(",") if x]
-    sigma, n_success = build_sigma(store, action_norm, args.sigma_kind, offset_horizons)
+    raw_sigma, n_success = build_sigma(store, action_norm, args.sigma_kind, offset_horizons)
+    # Floor near-constant dims so they cannot blow up / dominate the max envelope score.
+    sigma = np.maximum(raw_sigma, np.float32(args.sigma_floor)) if args.sigma_floor > 0 else raw_sigma
+    floored = [int(i) for i in np.where(raw_sigma < args.sigma_floor)[0]]
 
     grip_mid = float(action_norm.mean[REPR_ACTION_DIM - 1])  # gripper repr-mean (diagnostic)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         args.out,
         sigma=sigma,
+        raw_sigma=raw_sigma,
+        sigma_floor=np.float32(args.sigma_floor),
         cont_dims=np.asarray(ENVELOPE_CONT_DIMS, dtype=np.int64),
         grip_raw_idx=np.int64(GRIP_RAW_IDX),
         grip_mid=np.float32(grip_mid),
@@ -142,6 +151,7 @@ def main() -> None:
     )
     print(f"Wrote {args.out}")
     print(f"  episodes={n_success}  sigma_kind={args.sigma_kind}  cont_dims={ENVELOPE_CONT_DIMS}")
+    print(f"  sigma_floor={args.sigma_floor}  floored_dims(raw sigma < floor)={floored}")
     np.set_printoptions(precision=4, suppress=True)
     print(f"  sigma(cont)={sigma[ENVELOPE_CONT_DIMS]}")
     print(f"  sigma(gripper)={sigma[REPR_ACTION_DIM - 1]:.4f}  grip_mid={grip_mid:.4f}")
