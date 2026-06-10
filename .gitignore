@@ -183,3 +183,6 @@ test
 
 ssh/
 gitconfig
+*.jsonl
+# r3m_action_predictor non-source artifacts (run scripts, logs, pipeline_logs, thresholds.txt, etc.)
+research/r3m_action_predictor/local/

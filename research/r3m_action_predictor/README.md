@@ -1,5 +1,11 @@
 # R3M Action-Chunk Predictor
 
+> **Current pipeline & environment setup:** for the no-vision / envelope
+> collect→train→eval pipeline (`local/run_full_sweep.sh`, the path behind the
+> `*_novis_h10_envelope_sweep` runs), see
+> [SETUP_no_vision_envelope.md](SETUP_no_vision_envelope.md). The sections below
+> describe the original vision/R3M experiment and are partly historical.
+
 This experiment tests whether a lightweight model can predict future VLABench
 action chunks from:
 
