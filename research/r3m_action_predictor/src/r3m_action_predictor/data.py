@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from .action_repr import RAW_ACTION_DIM, REPR_ACTION_DIM, SINCOS_REPR_SLICE, euler_to_repr
-from .config import ACTION_DIM, STATE_DIM
+from .config import ACTION_DIM, STATE_DIM, VIEWS
 from .hf_data import EpisodeInfo
 
 
@@ -50,9 +50,15 @@ class FeatureStore:
             item = dict(np.load(ep.feature_path, allow_pickle=True))
             item["episode_index"] = ep.episode_index
             item["task"] = ep.task
-            item["embeddings"] = item["embeddings"].astype(np.float32)
             item["states"] = item["states"].astype(np.float32)
             item["actions"] = item["actions"].astype(np.float32)
+            if "embeddings" in item:
+                item["embeddings"] = item["embeddings"].astype(np.float32)
+            else:
+                # proprio-only cache (no R3M features stored): supply a zero placeholder so the
+                # shared schema and embedding normalizer still work. A no-vision predictor drops
+                # the view tokens entirely, so these embeddings are never read by the model.
+                item["embeddings"] = np.zeros((item["states"].shape[0], len(VIEWS), 1), np.float32)
             self.episodes.append(item)
 
     def iter_arrays(self):

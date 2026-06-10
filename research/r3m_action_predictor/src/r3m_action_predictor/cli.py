@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .config import ExperimentConfig
+from .config import ExperimentConfig, task_output_dir
 from .data import FeatureStore, make_loaders
 from .hf_data import (
     cleanup_episode_parquets,
@@ -44,7 +44,7 @@ def parse_args() -> ExperimentConfig:
     p.add_argument(
         "--model-kind",
         default=defaults.model_kind,
-        choices=("mlp_gru", "prob_transformer", "shared_prefix_risk_transformer", "retrieval_aug"),
+        choices=("mlp_gru", "prob_transformer", "shared_prefix_risk_transformer", "retrieval_aug", "finetune_encoder"),
     )
     p.add_argument("--target-mode", default=defaults.target_mode, choices=("absolute", "residual"))
     p.add_argument("--no-vision", dest="use_vision", action="store_false",
@@ -62,6 +62,8 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--retrieval-build-episodes", type=int, default=defaults.retrieval_build_episodes)
     p.add_argument("--retrieval-w-obs", type=float, default=defaults.retrieval_w_obs)
     p.add_argument("--retrieval-w-state", type=float, default=defaults.retrieval_w_state)
+    p.add_argument("--encoder-lr-mult", type=float, default=defaults.encoder_lr_mult)
+    p.add_argument("--grad-accum-steps", type=int, default=defaults.grad_accum_steps)
     p.add_argument("--prefix-risk-weight", type=float, default=defaults.prefix_risk_weight)
     p.add_argument("--prefix-risk-warmup-epochs", type=int, default=defaults.prefix_risk_warmup_epochs)
     p.add_argument("--prefix-pos-threshold", type=float, default=defaults.prefix_pos_threshold)
@@ -122,6 +124,8 @@ def _retrieval_attach_fn(cfg: ExperimentConfig, config: dict, action_episodes: l
 
 def main() -> None:
     cfg = parse_args()
+    cfg = replace(cfg, output_dir=task_output_dir(cfg.output_dir, cfg.task_name))
+    print(f"Output dir (task-grouped): {cfg.output_dir}", flush=True)
     config = cfg.to_jsonable()
     _set_seed(cfg.seed)
 
@@ -135,8 +139,18 @@ def main() -> None:
         f"{sum(e['length'] for e in selected)} frames",
         flush=True,
     )
-    episodes, extracted = _prepare_feature_files(selected, cfg, config)
-    print(f"Feature extraction completed; newly extracted episodes: {extracted}", flush=True)
+    if cfg.use_vision:
+        episodes, extracted = _prepare_feature_files(
+            selected, cfg, config, cleanup=(cfg.model_kind != "finetune_encoder")
+        )
+        print(f"Feature extraction completed; newly extracted episodes: {extracted}", flush=True)
+    else:
+        # Proprio-only predictor: skip R3M entirely and cache just state+actions (no parquet
+        # download, no image decode). See proprio_features.ensure_proprio_features.
+        from .proprio_features import ensure_proprio_features
+
+        episodes, extracted = ensure_proprio_features(selected, cfg.data_dir)
+        print(f"Proprio feature extraction completed; newly extracted episodes: {extracted}", flush=True)
 
     train_eps, val_eps, test_eps = split_episodes(
         episodes,
@@ -153,17 +167,25 @@ def main() -> None:
     )
     print(f"Episode split: train={len(train_eps)} val={len(val_eps)} test={len(test_eps)}", flush=True)
 
-    attach_fn = _retrieval_attach_fn(cfg, config, episodes) if cfg.model_kind == "retrieval_aug" else None
-    train_loader, val_loader, test_loader, normalizers, sample_counts = make_loaders(
-        train_eps,
-        val_eps,
-        test_eps,
-        cfg.prev_horizon,
-        cfg.pred_horizon,
-        cfg.batch_size,
-        cfg.obs_horizon,
-        attach_fn=attach_fn,
-    )
+    if cfg.model_kind == "finetune_encoder":
+        # Raw-image pipeline so the R3M encoder can be fine-tuned; same split/normalizers as baseline.
+        from .image_data import make_image_loaders
+
+        train_loader, val_loader, test_loader, normalizers, sample_counts = make_image_loaders(
+            train_eps, val_eps, test_eps, cfg.prev_horizon, cfg.pred_horizon, cfg.batch_size, cfg.data_dir, cfg.obs_horizon
+        )
+    else:
+        attach_fn = _retrieval_attach_fn(cfg, config, episodes) if cfg.model_kind == "retrieval_aug" else None
+        train_loader, val_loader, test_loader, normalizers, sample_counts = make_loaders(
+            train_eps,
+            val_eps,
+            test_eps,
+            cfg.prev_horizon,
+            cfg.pred_horizon,
+            cfg.batch_size,
+            cfg.obs_horizon,
+            attach_fn=attach_fn,
+        )
     print(f"Frame-chunk samples: {sample_counts}", flush=True)
 
     result = train_model(train_loader, val_loader, test_loader, normalizers, config, cfg.output_dir)
@@ -186,7 +208,11 @@ def _set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = True
 
 
-def _prepare_feature_files(selected: list[dict], cfg: ExperimentConfig, config: dict) -> tuple[list, int]:
+def _prepare_feature_files(
+    selected: list[dict], cfg: ExperimentConfig, config: dict, cleanup: bool = True
+) -> tuple[list, int]:
+    # cleanup=False keeps parquets on disk (encoder fine-tuning re-reads the images, so deleting
+    # them here would only force a re-download in make_image_loaders).
     episodes = []
     extracted_total = 0
     batch_size = 50
@@ -203,13 +229,14 @@ def _prepare_feature_files(selected: list[dict], cfg: ExperimentConfig, config: 
             cache_dir=cfg.cache_dir,
         )
         extracted_total += extracted
-        removed_count, removed_bytes = cleanup_episode_parquets(batch_eps)
-        if removed_count:
-            print(
-                f"Removed {removed_count} parquet files after feature extraction; "
-                f"freed {removed_bytes / (1024**3):.2f} GiB",
-                flush=True,
-            )
+        if cleanup:
+            removed_count, removed_bytes = cleanup_episode_parquets(batch_eps)
+            if removed_count:
+                print(
+                    f"Removed {removed_count} parquet files after feature extraction; "
+                    f"freed {removed_bytes / (1024**3):.2f} GiB",
+                    flush=True,
+                )
     return episodes, extracted_total
 
 

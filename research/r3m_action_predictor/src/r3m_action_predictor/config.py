@@ -10,6 +10,16 @@ ACTION_DIM = 7
 STATE_DIM = 7
 
 
+def task_output_dir(output_dir: Path, task_name: str) -> Path:
+    """Group runs by task: ``outputs/<name>`` -> ``outputs/<task>/<name>`` (same for
+    ``eval_runs``). A path whose parent is already a task subdir (or any other directory) is
+    returned unchanged, so this is idempotent and never double-nests."""
+    output_dir = Path(output_dir)
+    if output_dir.parent.name in ("outputs", "eval_runs"):
+        return output_dir.parent / task_name / output_dir.name
+    return output_dir
+
+
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
 
@@ -52,6 +62,10 @@ class ExperimentConfig:
     retrieval_build_episodes: int = 0
     retrieval_w_obs: float = 1.0
     retrieval_w_state: float = 1.0
+    # Encoder fine-tuning (model_kind="finetune_encoder"): backbone LR = lr * encoder_lr_mult,
+    # and grad_accum_steps lets a small image batch match the frozen baseline's effective batch.
+    encoder_lr_mult: float = 0.1
+    grad_accum_steps: int = 1
     prefix_risk_weight: float = 0.0
     prefix_risk_warmup_epochs: int = 0
     prefix_pos_threshold: float = 0.03

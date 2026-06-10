@@ -344,7 +344,66 @@ def split_model_output(model_out):
     return model_out, None, None
 
 
-def build_model(config: dict, embed_dim: int, num_views: int) -> nn.Module:
+class FinetuneEncoderActionPredictor(nn.Module):
+    """Trainable R3M encoder + the exact frozen-baseline prob-transformer head.
+
+    Forward takes raw images ``[B, V, 3, 224, 224]`` (uint8), runs them through R3M, applies the
+    frozen-feature standardization (so a freshly built model reproduces the frozen baseline's
+    inputs), then feeds the per-view embeddings to an inner ProbabilisticTransformer. Only R3M's
+    visual convnet is trainable and its BatchNorm runs in eval mode (frozen running stats), so the
+    encoder starts exactly at the pretrained operating point and only its weights adapt.
+    """
+
+    uses_images = True
+
+    def __init__(self, config: dict, num_views: int, cache_dir, r3m_model: str = "resnet18"):
+        super().__init__()
+        from pathlib import Path
+
+        from .r3m_features import ensure_r3m_repo, load_r3m_from_repo
+
+        r3m = load_r3m_from_repo(ensure_r3m_repo(Path(cache_dir)), r3m_model)
+        # Unwrap DataParallel and pin to CPU: load_r3m defaults to CUDA, but build_model must return
+        # a single-device (CPU) model like every other kind, so callers control placement via .to().
+        self.r3m = (r3m.module if isinstance(r3m, nn.DataParallel) else r3m).to("cpu")
+        embed_dim = int(self.r3m.outdim)
+        for p in self.r3m.parameters():
+            p.requires_grad_(False)
+        for p in self.r3m.convnet.parameters():  # fine-tune only the visual encoder
+            p.requires_grad_(True)
+        # Frozen-feature standardization; set from normalizers at train time or loaded from ckpt.
+        self.register_buffer("emb_mean", torch.zeros(1, embed_dim))
+        self.register_buffer("emb_std", torch.ones(1, embed_dim))
+        head_config = dict(config, model_kind="prob_transformer")  # identical to the frozen baseline head
+        self.predictor = build_model(head_config, embed_dim=embed_dim, num_views=num_views)
+
+    def set_embed_normalizer(self, mean, std) -> None:
+        self.emb_mean.copy_(torch.as_tensor(mean, dtype=torch.float32).reshape(1, -1))
+        self.emb_std.copy_(torch.as_tensor(std, dtype=torch.float32).reshape(1, -1))
+
+    def encode(self, images: torch.Tensor) -> torch.Tensor:
+        bsz, num_views = images.shape[:2]
+        flat = images.reshape(bsz * num_views, *images.shape[2:])  # [B*V, 3, 224, 224]
+        feats = self.r3m(flat, obs_shape=[3, flat.shape[-2], flat.shape[-1]])  # [B*V, embed_dim]
+        feats = feats.reshape(bsz, num_views, -1).float()
+        return (feats - self.emb_mean) / self.emb_std
+
+    def forward(self, images, state, prev_actions):
+        return self.predictor(self.encode(images), state, prev_actions)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.r3m.eval()  # keep BatchNorm/running stats frozen even while convnet weights train
+        return self
+
+    def param_groups(self, base_lr: float, encoder_lr: float):
+        return [
+            {"params": list(self.predictor.parameters()), "lr": base_lr},
+            {"params": list(self.r3m.convnet.parameters()), "lr": encoder_lr},
+        ]
+
+
+def build_model(config: dict, embed_dim: int, num_views: int, normalizers: dict | None = None) -> nn.Module:
     kind = config.get("model_kind", "mlp_gru")
     action_dim = int(config.get("action_dim", ACTION_DIM))
     if kind == "mlp_gru":
@@ -403,20 +462,29 @@ def build_model(config: dict, embed_dim: int, num_views: int) -> nn.Module:
             transformer_heads=config.get("transformer_heads", 4),
             dropout=config["dropout"],
         )
+    if kind == "finetune_encoder":
+        model = FinetuneEncoderActionPredictor(
+            config, num_views=num_views, cache_dir=config["cache_dir"], r3m_model=config.get("r3m_model", "resnet18")
+        )
+        if normalizers is not None:  # train time: bake the frozen-feature standardization in
+            model.set_embed_normalizer(normalizers["embedding"].mean, normalizers["embedding"].std)
+        return model
     raise ValueError(f"Unknown model_kind: {kind}")
 
 
 def run_model(model: nn.Module, batch: dict):
-    """Call a predictor, passing retrieved hints only when the model uses them and the batch
-    carries them. For every existing model this is exactly the old 3-argument call."""
+    """Call a predictor with the view input it expects: raw images for an encoder-fine-tuning
+    model, otherwise pre-extracted embeddings. Retrieved hints are passed only when the model
+    uses them and the batch carries them. For every existing model this is exactly the old call."""
+    views = batch["images"] if getattr(model, "uses_images", False) else batch["embeddings"]
     if getattr(model, "uses_retrieval", False) and "retr_actions" in batch:
         retrieved = {
             "actions": batch["retr_actions"],
             "sim": batch["retr_sim"],
             "mask": batch["retr_mask"],
         }
-        return model(batch["embeddings"], batch["state"], batch["prev_actions"], retrieved)
-    return model(batch["embeddings"], batch["state"], batch["prev_actions"])
+        return model(views, batch["state"], batch["prev_actions"], retrieved)
+    return model(views, batch["state"], batch["prev_actions"])
 
 
 def parameter_count(model: nn.Module) -> int:
