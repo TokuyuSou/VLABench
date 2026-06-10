@@ -3,12 +3,43 @@ from __future__ import annotations
 import json
 import random
 import re
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download
 
 from .config import REPO_ID
+
+
+def _hf_download_with_retry(filename: str, data_dir: Path, *, attempts: int = 6) -> Path:
+    """``hf_hub_download`` with retry + exponential backoff.
+
+    Parquet/metadata downloads from the Hub occasionally die mid-stream with transient network
+    errors (BrokenPipeError -> ChunkedEncodingError / ConnectionError), which would otherwise
+    abort a whole multi-hour feature-extraction run. The target files are known to exist, so we
+    simply retry; a genuinely missing file just fails fast on every attempt and is re-raised.
+    """
+    last_err: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return Path(
+                hf_hub_download(
+                    REPO_ID, repo_type="dataset", filename=filename, local_dir=data_dir
+                )
+            )
+        except Exception as err:  # noqa: BLE001 -- HF/requests raise many transient network types
+            last_err = err
+            if attempt == attempts:
+                break
+            wait = min(60.0, 2.0 ** attempt)
+            print(
+                f"  [retry {attempt}/{attempts - 1}] download {filename} failed: "
+                f"{type(err).__name__}: {err}; retrying in {wait:.0f}s",
+                flush=True,
+            )
+            time.sleep(wait)
+    raise RuntimeError(f"Failed to download {filename} after {attempts} attempts") from last_err
 
 
 @dataclass(frozen=True)
@@ -24,16 +55,7 @@ def download_metadata(meta_dir: Path) -> tuple[Path, Path, Path]:
     meta_dir.mkdir(parents=True, exist_ok=True)
     paths = []
     for filename in ("meta/info.json", "meta/tasks.jsonl", "meta/episodes.jsonl"):
-        paths.append(
-            Path(
-                hf_hub_download(
-                    REPO_ID,
-                    repo_type="dataset",
-                    filename=filename,
-                    local_dir=meta_dir,
-                )
-            )
-        )
+        paths.append(_hf_download_with_retry(filename, meta_dir))
     return tuple(paths)  # type: ignore[return-value]
 
 
@@ -72,14 +94,7 @@ def download_episode_parquets(episodes: list[dict], data_dir: Path) -> list[Epis
         if feature_path.exists():
             path = expected_path
         else:
-            path = Path(
-                hf_hub_download(
-                    REPO_ID,
-                    repo_type="dataset",
-                    filename=parquet_name(ep["episode_index"]),
-                    local_dir=data_dir,
-                )
-            )
+            path = _hf_download_with_retry(parquet_name(ep["episode_index"]), data_dir)
         out.append(
             EpisodeInfo(
                 episode_index=ep["episode_index"],
