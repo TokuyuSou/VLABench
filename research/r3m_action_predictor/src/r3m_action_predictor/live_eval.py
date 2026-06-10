@@ -56,6 +56,50 @@ class Args:
     r3m_cache_dir: str = "research/r3m_action_predictor/cache"
     predictor_device: str = "cpu"
     log_full_chunks: bool = True
+    # Familiarity veto (observation gate; OFF unless familiarity_pool_path is set).
+    # Vetoes a substitution when the current R3M view embeddings sit farther from the
+    # predictor's train demos (cosine kNN, see FamiliarityGate) than the threshold.
+    # Pool + val-calibrated default threshold come from build_familiarity_pool.py.
+    familiarity_pool_path: str | None = None
+    familiarity_threshold: float | None = None
+
+
+class FamiliarityGate:
+    """Observation-familiarity veto for the substitution gate.
+
+    dk = mean over the 3 views of (1 - mean top-k cosine similarity) between the current
+    raw R3M view embeddings and the predictor's train-demo pool (built offline by
+    build_familiarity_pool.py). Substitution is vetoed when dk > threshold; a false veto
+    only costs one extra VLA call. Offline analysis (select_toy/select_poker sweeps):
+    dk is uncorrelated with the envelope score, and executed substitutions with high dk
+    concentrate 98-100% in ultimately-failed episodes."""
+
+    def __init__(self, pool_path: str | Path, device: str, threshold: float | None = None, topk: int | None = None):
+        import torch
+
+        self._torch = torch
+        data = np.load(pool_path, allow_pickle=True)
+        emb = torch.from_numpy(np.asarray(data["embeddings"], dtype=np.float32))
+        emb = emb / emb.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        self.device = torch.device(device)
+        self.pool = emb.to(self.device)  # (N, V, 512), L2-normalized per view
+        self.topk = int(topk if topk is not None else data.get("topk", 5))
+        self.threshold = float(threshold if threshold is not None else data["suggested_threshold"])
+        self.pool_path = str(pool_path)
+
+    @property
+    def n_frames(self) -> int:
+        return int(self.pool.shape[0])
+
+    def distance(self, view_embeddings: np.ndarray) -> float:
+        """view_embeddings: (V, 512) raw R3M output of encode_views (view order = VIEWS)."""
+        t = self._torch
+        with t.no_grad():
+            q = t.from_numpy(np.asarray(view_embeddings, dtype=np.float32)).to(self.device)
+            q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            sims = t.einsum("vd,nvd->nv", q, self.pool)  # (N, V)
+            top = sims.topk(min(self.topk, sims.shape[0]), dim=0).values  # (k, V)
+            return float((1.0 - top.mean(dim=0)).mean().item())
 
 
 class HybridPi0Policy(Policy):
@@ -78,9 +122,12 @@ class HybridPi0Policy(Policy):
         envelope_gate: dict | None = None,
         envelope_threshold: float | None = None,
         aleatoric_threshold: float | None = None,
+        familiarity_gate: FamiliarityGate | None = None,
     ):
         self.model = client
         self.predictor = predictor
+        self.familiarity_gate = familiarity_gate
+        self.familiarity_vetoes = 0
         self.replan_steps = replan_steps
         self.confidence_threshold = confidence_threshold
         self.min_step_confidence = min_step_confidence
@@ -246,6 +293,12 @@ class HybridPi0Policy(Policy):
             if self.decision_metric in ("envelope", "aleatoric"):
                 decision["candidate_env_score"] = self._gate_score(candidate)
                 decision["candidate_gripper_changed"] = self._gripper_changes(candidate)
+            if self.familiarity_gate is not None:
+                emb = self.predictor.encode_views(
+                    image=image, second_image=second_image, wrist_image=image_wrist
+                )
+                decision["familiarity_dk"] = self.familiarity_gate.distance(emb)
+                decision["familiarity_threshold"] = self.familiarity_gate.threshold
 
         use_substitute, reject_reasons = self._should_substitute(decision, candidate)
         decision["use_substitute"] = use_substitute
@@ -348,6 +401,14 @@ class HybridPi0Policy(Policy):
                 reasons.append("confidence_below_threshold")
             if min_step_conf < self.min_step_confidence:
                 reasons.append("step_confidence_below_threshold")
+        if self.familiarity_gate is not None:
+            dk = decision.get("familiarity_dk")
+            if dk is None:
+                # gate enabled but no distance computed (encode failure): fail safe -> VLA
+                reasons.append("familiarity_unavailable")
+            elif float(dk) > self.familiarity_gate.threshold:
+                reasons.append("familiarity_veto")
+                self.familiarity_vetoes += 1
         # Per-episode VLA-call count (not the global cumulative one): the threshold calibration
         # simulates vla_calls=0 at each episode start, so the online gate must match it or later
         # episodes would substitute the moment history is ready. Falls back to the global counter
@@ -496,6 +557,10 @@ class HybridPi0Policy(Policy):
             "total_replans": self.vla_calls + self.substitutions,
             "replacement_fraction": self._replacement_fraction(),
             "rejected_candidates": self.rejected_candidates,
+            "familiarity_threshold": (
+                self.familiarity_gate.threshold if self.familiarity_gate is not None else None
+            ),
+            "familiarity_vetoes": self.familiarity_vetoes,
             "episode_stats": self.episode_stats,
             "skip_by_outcome": skip_by_outcome(self.episode_stats, self._success_by_episode()),
             "metrics": metrics,
@@ -602,6 +667,18 @@ def main(args: Args) -> None:
     envelope_gate = None
     if args.envelope_gate_path:
         envelope_gate = dict(np.load(args.envelope_gate_path, allow_pickle=True))
+    familiarity_gate = None
+    if args.familiarity_pool_path:
+        familiarity_gate = FamiliarityGate(
+            args.familiarity_pool_path,
+            device=args.predictor_device,
+            threshold=args.familiarity_threshold,
+        )
+        print(
+            f"[live_eval] familiarity gate: pool={familiarity_gate.n_frames} frames "
+            f"threshold={familiarity_gate.threshold:.4f} topk={familiarity_gate.topk}",
+            flush=True,
+        )
     policy = HybridPi0Policy(
         client,
         predictor,
@@ -619,6 +696,7 @@ def main(args: Args) -> None:
         envelope_gate=envelope_gate,
         envelope_threshold=args.envelope_threshold,
         aleatoric_threshold=args.aleatoric_threshold,
+        familiarity_gate=familiarity_gate,
     )
 
     evaluator = Evaluator(
@@ -633,6 +711,17 @@ def main(args: Args) -> None:
     try:
         results = evaluator.evaluate(policy)
         policy.write_summary(results)
+        # Default visual report (best-effort; never fail the eval over a plotting error).
+        try:
+            from .visualize_run import make_report
+
+            report = make_report(save_dir, meta={
+                "task": args.tasks, "replan_steps": args.replan_steps,
+                "prev_horizon": policy.prev_horizon, "pred_horizon": policy.pred_horizon,
+            })
+            print(f"[live_eval] report -> {report}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[live_eval] report generation skipped: {exc}", flush=True)
     finally:
         policy.close()
 

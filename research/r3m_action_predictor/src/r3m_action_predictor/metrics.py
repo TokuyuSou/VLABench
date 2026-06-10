@@ -36,6 +36,37 @@ def log_scalars(writer, prefix: str, metrics: dict, step: int) -> None:
             writer.add_scalar(f"{prefix}/{key}", float(value), step)
 
 
+def skip_by_outcome(episode_stats: list, success_by_ep: dict) -> dict:
+    """Split the per-episode VLA-skip (substitution) fraction by task outcome.
+
+    ``episode_stats`` is the policy's per-episode list (each with episode_index, vla_calls,
+    substitutions). ``success_by_ep`` maps episode_index -> bool. Episodes with no entry
+    (e.g. physics-crashed, hence no video/label) are reported under 'unlabeled'. Reports both
+    the mean of per-episode fractions and the pooled fraction (total subs / total replans)."""
+    groups: dict[str, list] = {"success": [], "failure": [], "unlabeled": []}
+    for es in episode_stats:
+        e = int(es["episode_index"])
+        repl = int(es.get("vla_calls", 0)) + int(es.get("substitutions", 0))
+        frac = es["substitutions"] / repl if repl else 0.0
+        g = "success" if success_by_ep.get(e) else ("failure" if e in success_by_ep else "unlabeled")
+        groups[g].append((frac, int(es["substitutions"]), repl))
+    out = {}
+    for g, rows in groups.items():
+        if not rows:
+            out[g] = {"n_episodes": 0}
+            continue
+        subs = sum(r[1] for r in rows)
+        repl = sum(r[2] for r in rows)
+        out[g] = {
+            "n_episodes": len(rows),
+            "mean_episode_skip_fraction": round(sum(r[0] for r in rows) / len(rows), 4),
+            "pooled_skip_fraction": round(subs / repl, 4) if repl else 0.0,
+            "total_substitutions": subs,
+            "total_replans": repl,
+        }
+    return out
+
+
 def _wrap_rot_err(err: np.ndarray) -> np.ndarray:
     """Wrap the Euler-rotation error columns (3:6) into (-pi, pi] so that physically
     identical orientations (e.g. predicting +pi for a -pi target) score ~zero."""
@@ -55,6 +86,7 @@ def evaluate(
     normalizers: dict[str, Normalizer],
     device: torch.device,
     target_mode: str = "absolute",
+    max_batches: int | None = None,
 ) -> dict[str, float]:
     model.eval()
     # "action" is the sin/cos repr normalizer (model decode); "action_euler" is the
@@ -67,7 +99,9 @@ def evaluate(
 
     preds, targets, repeat_preds, mean_preds = [], [], [], []
     pred_stds = []
-    for batch in loader:
+    for bi, batch in enumerate(loader):
+        if max_batches is not None and bi >= max_batches:  # evaluate a subset (e.g. train monitoring)
+            break
         batch = batch_to_device(batch, device)
         target = batch["raw_target"]
         repeat = batch["raw_prev_actions"][:, -1:, :].repeat(1, target.shape[1], 1)
