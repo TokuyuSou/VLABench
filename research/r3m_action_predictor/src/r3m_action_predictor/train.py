@@ -22,13 +22,26 @@ def train_model(
     normalizers: dict[str, Normalizer],
     config: dict,
     out_dir: Path,
+    init_state_dict: dict | None = None,
 ) -> dict:
     sample = next(iter(train_loader))
-    model = build_model(config, embed_dim=sample["embeddings"].shape[-1], num_views=sample["embeddings"].shape[-2])
+    if config.get("model_kind") == "finetune_encoder":
+        # Image batch [B, V, 3, H, W]; the encoder owns embed_dim, normalizers bake in standardization.
+        model = build_model(config, embed_dim=0, num_views=sample["images"].shape[-4], normalizers=normalizers)
+    else:
+        model = build_model(config, embed_dim=sample["embeddings"].shape[-1], num_views=sample["embeddings"].shape[-2])
+    # Warm-start (e.g. rollout fine-tuning continues from a demo-trained checkpoint). Default None
+    # preserves the from-scratch behaviour of every existing caller.
+    if init_state_dict is not None:
+        model.load_state_dict(init_state_dict)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
+    if hasattr(model, "param_groups"):  # discriminative LR (e.g. low LR on a fine-tuned encoder)
+        encoder_lr = config["lr"] * float(config.get("encoder_lr_mult", 0.1))
+        opt = torch.optim.AdamW(model.param_groups(config["lr"], encoder_lr), weight_decay=config["weight_decay"])
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(config["epochs"], 1))
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
@@ -36,22 +49,34 @@ def train_model(
     best_state = None
     best_val = float("inf")
     history = []
+    tmode = config.get("target_mode", "absolute")
+    # Decode train metrics (RMSE etc.) on a val-sized shuffled subset each epoch, so the log shows
+    # the same interpretable numbers for train as for val (the raw loss alone is hard to read, and
+    # train-vs-val RMSE makes over/under-fitting visible). Subset keeps the extra eval cost ~= val.
+    train_eval_batches = max(1, len(val_loader))
     for epoch in range(1, config["epochs"] + 1):
         train_loss = _train_one_epoch(model, train_loader, opt, scaler, device, config, epoch, normalizers["action"])
         scheduler.step()
-        val_metrics = evaluate(model, val_loader, normalizers, device, config.get("target_mode", "absolute"))
-        history.append({"epoch": epoch, "train_loss": train_loss, **val_metrics})
+        val_metrics = evaluate(model, val_loader, normalizers, device, tmode)
+        train_metrics = evaluate(model, train_loader, normalizers, device, tmode, max_batches=train_eval_batches)
+        history.append({"epoch": epoch, "train_loss": train_loss, "train_metrics": train_metrics, **val_metrics})
         print(
-            f"epoch {epoch:03d} train_loss={train_loss:.4f} "
+            f"epoch {epoch:03d} loss={train_loss:.4f} "
+            f"train_rmse={train_metrics['model_rmse']:.5f} "
             f"val_rmse={val_metrics['model_rmse']:.5f} "
             f"repeat={val_metrics['repeat_last_rmse']:.5f}",
             flush=True,
         )
         log_scalars(writer, "train", {"loss": train_loss, "lr": opt.param_groups[0]["lr"]}, epoch)
+        log_scalars(writer, "train_eval", train_metrics, epoch)
         log_scalars(writer, "val", val_metrics, epoch)
         if val_metrics["model_rmse"] < best_val:
             best_val = val_metrics["model_rmse"]
             best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            # Persist the best checkpoint as soon as it improves, so a killed/crashed run keeps it
+            # (the current weights ARE the new best at this point).
+            _write_checkpoint(model, normalizers, config, out_dir)
+            print(f"  saved best checkpoint (val_rmse={best_val:.5f})", flush=True)
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -84,18 +109,24 @@ def _train_one_epoch(
     losses = []
     action_mean = torch.from_numpy(action_norm.mean).to(device=device, dtype=torch.float32)
     action_std = torch.from_numpy(action_norm.std).to(device=device, dtype=torch.float32)
-    for batch in train_loader:
+    # grad_accum_steps>1 (image fine-tuning) sums gradients over micro-batches so a small image
+    # batch matches the frozen baseline's effective batch. accum==1 is exactly the original loop.
+    accum = max(1, int(config.get("grad_accum_steps", 1)))
+    n_batches = len(train_loader)
+    opt.zero_grad(set_to_none=True)
+    for i, batch in enumerate(train_loader):
         batch = batch_to_device(batch, device)
-        opt.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
             model_out = run_model(model, batch)
             target = _training_target(batch, config)
             loss = _loss_for_output(model_out, target, batch, action_mean, action_std, config, epoch)
-        scaler.scale(loss).backward()
-        scaler.unscale_(opt)
-        nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
-        scaler.step(opt)
-        scaler.update()
+        scaler.scale(loss / accum).backward()
+        if (i + 1) % accum == 0 or (i + 1) == n_batches:
+            scaler.unscale_(opt)
+            nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
+            scaler.step(opt)
+            scaler.update()
+            opt.zero_grad(set_to_none=True)
         losses.append(float(loss.detach().cpu()))
     return float(np.mean(losses))
 
